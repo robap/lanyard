@@ -14,6 +14,7 @@ use lanyard_cli::client::{self, MintRequest};
 use lanyard_cli::config::Config;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
+use lanyard_cli::store::Stores;
 
 async fn spawn() -> String {
     let config = Config::resolve(|key| match key {
@@ -26,6 +27,7 @@ async fn spawn() -> String {
         config,
         key,
         personas: Personas::builtin(),
+        stores: Stores::default(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -59,7 +61,8 @@ fn payload_of(token: &str) -> serde_json::Value {
 
 /// Run the real binary with a clean environment: no `LANYARD_*` leaking in from
 /// the operator's shell, and a `HOME` that does not exist, so nothing here can
-/// read or write real dotfiles.
+/// read or write real dotfiles. The three exceptions — `HOME`, `PATH` and, under
+/// a coverage run, `LLVM_PROFILE_FILE` — are put back deliberately below.
 ///
 /// This blocks the calling thread, so every test that calls it while a router is
 /// running in-process must be a `multi_thread` one — a single-threaded runtime
@@ -73,6 +76,19 @@ fn run(url: Option<&str>, args: &[&str]) -> Output {
         .args(args);
     if let Some(url) = url {
         command.env("LANYARD_URL", url);
+    }
+    // The one variable that is not the operator's, put back after `env_clear`.
+    //
+    // `cargo llvm-cov` uses `LLVM_PROFILE_FILE` to tell an instrumented binary
+    // where to write its coverage profile. A child that loses it falls back to
+    // LLVM's default filename and drops a `default_*.profraw` in whatever
+    // directory the test happened to run from — the repository root. Those
+    // profiles are never merged, so `main.rs` reports 0% coverage that these
+    // twenty-odd tests actually give it, and the stray files land in
+    // `git status`. Absent outside a coverage run, in which case nothing is set
+    // and the environment stays as clean as the doc comment says.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
     }
     command.output().unwrap()
 }

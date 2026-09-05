@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::oidc::flaw::{Flaw, EXPIRED_SHIFT, WRONG_ISSUER};
 use lanyard_cli::oidc::issue::{claims_at, issue, DEFAULT_TTL};
+use lanyard_cli::oidc::scope::{ClaimFilter, Scopes};
 use lanyard_cli::persona::Personas;
 
 const ISSUER: &str = "http://127.0.0.1:9500/oidc";
@@ -22,7 +23,16 @@ fn mint(persona: Option<&str>, over: Value, ttl: u64) -> Map<String, Value> {
 fn flawed(persona: Option<&str>, over: Value, ttl: u64, flaw: Option<Flaw>) -> Map<String, Value> {
     let personas = Personas::builtin();
     let p = persona.map(|id| personas.get(id).unwrap());
-    claims_at(NOW, ISSUER, p, &overrides(over), ttl, "test-jti", flaw)
+    claims_at(
+        NOW,
+        ISSUER,
+        p,
+        &overrides(over),
+        ttl,
+        "test-jti",
+        flaw,
+        &ClaimFilter::Unfiltered,
+    )
 }
 
 #[test]
@@ -100,6 +110,7 @@ fn attributes_become_top_level_claims() {
         DEFAULT_TTL,
         "test-jti",
         None,
+        &ClaimFilter::Unfiltered,
     );
 
     assert_eq!(c["department"], "platform");
@@ -147,6 +158,7 @@ fn issuing_signs_the_claims_it_returns() {
         &overrides(json!({"aud": "billing-api"})),
         DEFAULT_TTL,
         None,
+        &ClaimFilter::Unfiltered,
     )
     .unwrap();
     let (token, claims) = (issued.token, issued.claims);
@@ -166,8 +178,26 @@ fn issuing_signs_the_claims_it_returns() {
 #[test]
 fn each_token_gets_its_own_jti() {
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
-    let a = issue(&key, ISSUER, None, &Map::new(), DEFAULT_TTL, None).unwrap();
-    let b = issue(&key, ISSUER, None, &Map::new(), DEFAULT_TTL, None).unwrap();
+    let a = issue(
+        &key,
+        ISSUER,
+        None,
+        &Map::new(),
+        DEFAULT_TTL,
+        None,
+        &ClaimFilter::Unfiltered,
+    )
+    .unwrap();
+    let b = issue(
+        &key,
+        ISSUER,
+        None,
+        &Map::new(),
+        DEFAULT_TTL,
+        None,
+        &ClaimFilter::Unfiltered,
+    )
+    .unwrap();
     assert_ne!(a.claims["jti"], b.claims["jti"]);
 }
 
@@ -288,7 +318,16 @@ fn the_header_level_flaws_leave_the_claims_alone() {
 #[test]
 fn issuing_hands_back_the_moment_it_used() {
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
-    let issued = issue(&key, ISSUER, None, &Map::new(), DEFAULT_TTL, None).unwrap();
+    let issued = issue(
+        &key,
+        ISSUER,
+        None,
+        &Map::new(),
+        DEFAULT_TTL,
+        None,
+        &ClaimFilter::Unfiltered,
+    )
+    .unwrap();
     assert_eq!(
         issued.claims["exp"].as_u64().unwrap() - issued.issued_at,
         DEFAULT_TTL
@@ -305,6 +344,7 @@ fn issuing_expired_signs_the_shifted_claims() {
         &Map::new(),
         DEFAULT_TTL,
         Some(Flaw::Expired),
+        &ClaimFilter::Unfiltered,
     )
     .unwrap();
 
@@ -314,4 +354,117 @@ fn issuing_expired_signs_the_shifted_claims() {
     .unwrap();
     assert_eq!(payload, Value::Object(issued.claims));
     assert!(payload["exp"].as_u64().unwrap() < issued.issued_at);
+}
+
+// ----------------------------------------------------- the scope filter --
+//
+// One function, one persona→claims table, one new parameter. The filter is a
+// parameter of `issue()` rather than a second claim builder, and these pin the
+// two properties that makes it safe: it reaches step 1 only, and it never
+// removes a claim the caller asked for by name.
+
+fn filtered(persona: &str, scope: &str, over: Value) -> Map<String, Value> {
+    let personas = Personas::builtin();
+    claims_at(
+        NOW,
+        ISSUER,
+        personas.get(persona),
+        &overrides(over),
+        DEFAULT_TTL,
+        "test-jti",
+        None,
+        &ClaimFilter::ByScope(Scopes::parse(Some(scope))),
+    )
+}
+
+#[test]
+fn openid_alone_yields_sub_and_roles_and_no_profile_or_email() {
+    let c = filtered("ada", "openid", json!({}));
+    assert_eq!(c["sub"], "ada");
+    assert_eq!(c["roles"], json!(["admin", "user"]));
+    assert!(c.get("email").is_none(), "email needs the email scope");
+    assert!(c.get("email_verified").is_none());
+    assert!(c.get("name").is_none(), "name needs the profile scope");
+    assert!(c.get("preferred_username").is_none());
+}
+
+#[test]
+fn the_email_scope_admits_both_email_claims_and_nothing_else() {
+    let c = filtered("ada", "openid email", json!({}));
+    assert_eq!(c["email"], "ada@example.test");
+    assert_eq!(c["email_verified"], true);
+    assert!(c.get("name").is_none(), "still no profile scope");
+}
+
+#[test]
+fn the_profile_scope_admits_the_display_identity() {
+    let c = filtered("ada", "openid email profile", json!({}));
+    assert_eq!(c["name"], "Ada Bell");
+    assert_eq!(c["preferred_username"], "ada");
+    assert_eq!(c["email"], "ada@example.test");
+}
+
+/// **Step 1 only.** The filter decides which of the persona's claims survive; it
+/// has no opinion about `iss`, `exp` or anything the caller passed as an
+/// override. An `aud` that vanished because the request did not ask for
+/// `profile` would be a filter that had escaped its step.
+#[test]
+fn the_filter_never_touches_the_registered_claims_or_the_overrides() {
+    let c = filtered(
+        "ada",
+        "openid",
+        json!({"aud": "billing-web", "nonce": "n-1"}),
+    );
+    assert_eq!(c["iss"], ISSUER);
+    assert_eq!(c["iat"], NOW);
+    assert_eq!(c["exp"], NOW + DEFAULT_TTL);
+    assert_eq!(c["jti"], "test-jti");
+    assert_eq!(c["aud"], "billing-web");
+    assert_eq!(c["nonce"], "n-1");
+}
+
+/// A persona's own attributes are unscoped: OIDC defines no scope for them, and
+/// gating them behind a standard one would be lanyard inventing a rule.
+#[test]
+fn arbitrary_attributes_survive_the_narrowest_scope() {
+    let personas = Personas::parse(
+        "personas:\n  - id: zed\n    attributes:\n      department: ops\n",
+        std::path::Path::new("/tmp/users.yaml"),
+    )
+    .unwrap();
+    let c = claims_at(
+        NOW,
+        ISSUER,
+        personas.get("zed"),
+        &Map::new(),
+        DEFAULT_TTL,
+        "test-jti",
+        None,
+        &ClaimFilter::ByScope(Scopes::parse(Some("openid"))),
+    );
+    assert_eq!(c["department"], "ops");
+}
+
+/// The persona that breaks applications must survive the filter rather than
+/// break lanyard: `nobody` under the widest scope is `sub` plus the registered
+/// claims and nothing else, and that is a login that succeeds.
+#[test]
+fn nobody_under_every_scope_is_sub_and_the_registered_claims() {
+    let c = filtered("nobody", "openid email profile", json!({}));
+    assert_eq!(c["sub"], "nobody");
+    let mut keys: Vec<&str> = c.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["exp", "iat", "iss", "jti", "nbf", "sub"]);
+}
+
+/// Phase 2 and Phase 3's callers pass `Unfiltered`, and this is the assertion
+/// that they are byte-identical to before: the same persona through the same
+/// function with no filter carries everything it always did.
+#[test]
+fn unfiltered_is_exactly_what_phase_two_minted() {
+    let c = mint(Some("ada"), json!({}), DEFAULT_TTL);
+    assert_eq!(c["email"], "ada@example.test");
+    assert_eq!(c["name"], "Ada Bell");
+    assert_eq!(c["preferred_username"], "ada");
+    assert_eq!(c["email_verified"], true);
 }

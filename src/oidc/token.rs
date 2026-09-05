@@ -10,8 +10,10 @@
 //! on this endpoint has to be ours and carry the OAuth
 //! `{"error", "error_description"}` shape, not axum's 415 or 422.
 //!
-//! Dispatch on `grant_type` has exactly one arm today. Phase 4 adds
-//! `authorization_code` as a second arm rather than a second handler.
+//! Dispatch on `grant_type` has two arms, and Phase 4 added the second one as
+//! an arm rather than as a second handler — which is the point. A browser login
+//! and a `client_credentials` grant mint through the same `issue()` call with
+//! the same claim table, and criterion 23 is the assertion that they still do.
 //!
 //! Phase 3's `flaw` parameter is parsed here and applied nowhere: it is turned
 //! into a [`Flaw`] and handed to the same one function. The response says
@@ -29,7 +31,12 @@ use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
 use crate::oidc::flaw::Flaw;
-use crate::oidc::issue::{self, DEFAULT_TTL};
+use crate::oidc::issue::{self, DEFAULT_TTL, ID_TOKEN_TTL};
+use crate::oidc::scope::ClaimFilter;
+use crate::store::Lookup;
+
+/// Named once so the two "what is supported" messages cannot drift apart.
+const SUPPORTED: &str = "client_credentials and authorization_code";
 
 pub fn route() -> axum::routing::MethodRouter<SharedState> {
     // `post` alone: axum answers `GET /oidc/token` with 405 and an `Allow`
@@ -46,14 +53,13 @@ async fn token(State(state): State<SharedState>, headers: HeaderMap, body: Bytes
     match form.get("grant_type") {
         None => bad_request(
             "invalid_request",
-            "grant_type is required; this build supports client_credentials".to_string(),
+            format!("grant_type is required; this build supports {SUPPORTED}"),
         ),
         Some("client_credentials") => client_credentials(&state, &headers, &form),
+        Some("authorization_code") => authorization_code(&state, &form),
         Some(other) => bad_request(
             "unsupported_grant_type",
-            format!(
-                "grant_type {other:?} is not supported; this build supports client_credentials"
-            ),
+            format!("grant_type {other:?} is not supported; this build supports {SUPPORTED}"),
         ),
     }
 }
@@ -119,6 +125,10 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
         &overrides,
         DEFAULT_TTL,
         flaw,
+        // Access tokens are never scope-filtered: OIDC Core §5.4 specifies
+        // claims-per-scope for the ID token and UserInfo, and nothing specifies
+        // it here. Phase 2's contract stays byte-identical.
+        &ClaimFilter::Unfiltered,
     ) {
         Ok(issued) => {
             // The token's actual remaining life, floored at zero, rather than
@@ -151,6 +161,206 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
         )
             .into_response(),
     }
+}
+
+/// The browser flow's other end. The human already clicked; this redeems what
+/// that click produced.
+///
+/// **Six distinct `invalid_grant` descriptions**, because Phase 6's log has to
+/// be able to say "which parameter mismatched" and it can only report what this
+/// phase distinguishes. Every one of them is a real check: PKCE, single use,
+/// expiry and the `redirect_uri` match cost nothing and are exactly the checks
+/// whose absence makes a mock diverge from the real thing.
+fn authorization_code(state: &SharedState, form: &Form) -> Response {
+    let Some(code) = form.get("code") else {
+        return bad_request(
+            "invalid_request",
+            "code is required for grant_type=authorization_code".to_string(),
+        );
+    };
+
+    let record = {
+        let mut codes = state.stores.codes.lock().expect("codes");
+        match codes.take(code) {
+            Lookup::Found(record) => record,
+            Lookup::Spent => {
+                return invalid_grant(
+                    "that authorization code has already been exchanged; \
+                     codes are single-use",
+                )
+            }
+            Lookup::Expired => {
+                return invalid_grant(
+                    "that authorization code has expired; codes live 60 seconds, \
+                     which is the redirect and the exchange and nothing else",
+                )
+            }
+            Lookup::Unknown => {
+                return invalid_grant(
+                    "no such authorization code; it was never issued, or lanyard \
+                     was restarted since it was",
+                )
+            }
+        }
+    };
+
+    // Compared as URLs rather than as strings, so a client that reassembles the
+    // value it sent does not fail on a trailing slash it never meant.
+    //
+    // **Absent is not a mismatch.** RFC 6749 §4.1.3 says to require it, but
+    // requiring a parameter an SDK chose not to resend is a registration-shaped
+    // "no" on an endpoint that has none, and it catches no bug. A *wrong* one
+    // does catch a bug, and that is the case below.
+    if let Some(presented) = form.get("redirect_uri") {
+        let matches = url::Url::parse(presented)
+            .map(|url| url == record.request.redirect_uri)
+            .unwrap_or(false);
+        if !matches {
+            return invalid_grant(&format!(
+                "redirect_uri {presented:?} does not match the one this code was \
+                 issued against, {:?}",
+                record.request.redirect_uri.as_str()
+            ));
+        }
+    }
+
+    // **PKCE is genuinely verified, and this is not a contradiction of north
+    // star 1.** Accept-everything is about registration — who you say you are,
+    // where you say you want to come back to. It was never about skipping the
+    // cryptography. A local IdP that rubber-stamps a wrong `code_verifier` lets
+    // a broken PKCE implementation ship.
+    if let Some(challenge) = &record.request.challenge {
+        let Some(verifier) = form.get("code_verifier") else {
+            return invalid_grant(&format!(
+                "this code was issued against a {} code_challenge, so a \
+                 code_verifier is required",
+                challenge.method.as_str()
+            ));
+        };
+        if !challenge.verify(verifier) {
+            return invalid_grant(&format!(
+                "the code_verifier does not match the {} code_challenge this code \
+                 was issued against",
+                challenge.method.as_str()
+            ));
+        }
+    }
+    // A `code_verifier` sent when no challenge was recorded is ignored, exactly
+    // as any other unrecognized parameter is.
+
+    let request = &record.request;
+
+    let mut overrides = Map::new();
+    // The access token's `aud` is the API audience the authorization request
+    // named — **not** the `client_id`. The `client_id` is the ID token's `aud`,
+    // and conflating the two is the mistake this comment exists to prevent.
+    if let Some(audience) = &request.audience {
+        overrides.insert("aud".into(), Value::from(audience.clone()));
+    }
+    if let Some(scope) = &request.scope_raw {
+        overrides.insert("scope".into(), Value::from(scope.clone()));
+    }
+    overrides.insert("client_id".into(), Value::from(request.client_id.clone()));
+
+    let access = match issue::issue(
+        &state.key,
+        &state.config.issuer,
+        Some(&record.persona),
+        &overrides,
+        DEFAULT_TTL,
+        // Phase 3's `flaw` is out of scope on this arm: the spec defers a
+        // flawed ID token to a later phase, and a flawed access token from a
+        // browser login has no way to be asked for.
+        None,
+        // Not filtered. OIDC Core §5.4 specifies claims-per-scope for the ID
+        // token and UserInfo and says nothing about an access token — so this
+        // stays byte-identical to what `lanyard token --as ada` mints, which is
+        // criterion 23.
+        &ClaimFilter::Unfiltered,
+    ) {
+        Ok(issued) => issued,
+        Err(message) => return issuance_failed(message),
+    };
+
+    let expires_in = access
+        .claims
+        .get("exp")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_sub(access.issued_at);
+
+    let mut body = json!({
+        "access_token": access.token,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+    });
+    if let Some(scope) = &request.scope_raw {
+        body["scope"] = Value::from(scope.clone());
+    }
+
+    // **A second call to the same function**, made after the access token
+    // because `at_hash` is a hash *of* the access token. Two calls, one
+    // `issue()`, one persona→claims table — which is north star 3's whole claim,
+    // and criterion 23 is what fails if an ID token's claims ever get assembled
+    // anywhere else.
+    //
+    // Only when `openid` was asked for. A request without it is a plain OAuth
+    // 2.0 code flow and gets a plain OAuth 2.0 response, which is honest and is
+    // a thing worth being able to test.
+    if request.scope.is_openid() {
+        let mut registered = Map::new();
+        // **The client_id, not the API audience.** An ID token says "this
+        // person authenticated to you"; an access token says "bearer may act at
+        // that API". Conflating the two is the mistake this line exists to not
+        // make.
+        registered.insert("aud".into(), Value::from(request.client_id.clone()));
+        // May legitimately predate `iat` — that is what a remembered session
+        // means, and an RP checking `max_age` needs the real moment.
+        registered.insert("auth_time".into(), Value::from(record.auth_time));
+        if let Some(nonce) = &request.nonce {
+            registered.insert("nonce".into(), Value::from(nonce.clone()));
+        }
+        registered.insert(
+            "at_hash".into(),
+            Value::from(issue::half_hash(&access.token)),
+        );
+        // Emitted although OIDC Core requires it only for `code id_token`. It
+        // costs a hash, and an RP that validates it should find it valid —
+        // which is a better test of that RP than never exercising the path.
+        registered.insert("c_hash".into(), Value::from(issue::half_hash(code)));
+
+        match issue::issue(
+            &state.key,
+            &state.config.issuer,
+            Some(&record.persona),
+            &registered,
+            ID_TOKEN_TTL,
+            None,
+            &ClaimFilter::ByScope(request.scope.clone()),
+        ) {
+            // The ID token also carries `nbf` and `jti`, because `claims_at`
+            // adds them to everything. Both are legal registered claims, and
+            // stripping them would mean a second claim path for the sake of two
+            // fields no relying party objects to. Decided, not accidental.
+            Ok(id_token) => body["id_token"] = Value::from(id_token.token),
+            Err(message) => return issuance_failed(message),
+        }
+    }
+
+    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
+/// `400` in the OAuth shape, with a description that names what failed.
+fn invalid_grant(description: &str) -> Response {
+    bad_request("invalid_grant", description.to_string())
+}
+
+fn issuance_failed(message: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "issuance_failed", "error_description": message })),
+    )
+        .into_response()
 }
 
 /// The username half of `Authorization: Basic`, which RFC 6749 §2.3.1 defines as
@@ -193,7 +403,12 @@ fn bad_request(error: &str, description: String) -> Response {
 
 /// The decoded form, kept as ordered pairs so a repeated parameter resolves to
 /// its first occurrence rather than to whichever one a map happened to keep.
-struct Form(Vec<(String, String)>);
+///
+/// `/oidc/authorize` parses its query string and its POST body with this too.
+/// The two endpoints have to agree that an empty value is an absent one — `-d
+/// scope=` and `?scope=` are the same shrug — and the only way two endpoints
+/// agree about that forever is by sharing the code that decides it.
+pub(crate) struct Form(Vec<(String, String)>);
 
 impl Form {
     /// Infallible, and that is an observed fact rather than an assumption:
@@ -206,14 +421,28 @@ impl Form {
     /// The content-type header is deliberately not consulted. Rejecting a
     /// well-formed body over its label would be the one registration-shaped
     /// "no" on an endpoint whose whole point is that it has none.
-    fn parse(body: &Bytes) -> Self {
+    pub(crate) fn parse(body: &Bytes) -> Self {
         Form(serde_urlencoded::from_bytes::<Vec<(String, String)>>(body).unwrap_or_default())
+    }
+
+    /// The same decoding for a query string, which arrives as a `&str` rather
+    /// than as bytes.
+    pub(crate) fn from_query(query: &str) -> Self {
+        Form(serde_urlencoded::from_str::<Vec<(String, String)>>(query).unwrap_or_default())
+    }
+
+    /// Body parameters win over query parameters of the same name: OIDC Core
+    /// §3.1.2.1 puts them in the body on a `POST`, and a client that sends both
+    /// meant the body.
+    pub(crate) fn chain(mut self, other: Form) -> Self {
+        self.0.extend(other.0);
+        self
     }
 
     /// An empty value is the same as an absent one. `-d scope=` should not echo
     /// an empty `scope`, and `-d grant_type=` should not name an unsupported
     /// grant of `""`.
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()
             .find(|(key, value)| key == name && !value.is_empty())

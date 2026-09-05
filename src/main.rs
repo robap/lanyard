@@ -6,6 +6,7 @@ use lanyard_cli::app::{self, AppState};
 use lanyard_cli::client::{self, MintRequest};
 use lanyard_cli::oidc::flaw::Flaw;
 use lanyard_cli::persona::Personas;
+use lanyard_cli::store::Stores;
 use lanyard_cli::{banner, config::Config, keys};
 
 #[derive(Parser)]
@@ -154,6 +155,7 @@ async fn serve() -> Result<(), String> {
         "{}",
         banner::render(&banner::Banner {
             issuer: &config.issuer,
+            ui: &config.ui_url(),
             listen: &addr,
             data_dir: &config.data_dir.display().to_string(),
             kid: key.kid(),
@@ -165,6 +167,7 @@ async fn serve() -> Result<(), String> {
         config,
         key,
         personas,
+        stores: Stores::default(),
     });
 
     axum::serve(listener, app::router(state))

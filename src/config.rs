@@ -93,6 +93,22 @@ impl Config {
     pub fn token_endpoint(&self) -> String {
         format!("{}/token", self.issuer)
     }
+
+    pub fn authorization_endpoint(&self) -> String {
+        format!("{}/authorize", self.issuer)
+    }
+
+    pub fn userinfo_endpoint(&self) -> String {
+        format!("{}/userinfo", self.issuer)
+    }
+
+    /// The persona picker, for the banner to print. Derived from the issuer
+    /// rather than from the bind address, because the issuer is the one address
+    /// everything else in this file is derived from — and because a banner that
+    /// printed `0.0.0.0:9500` would print a URL that does not open.
+    pub fn ui_url(&self) -> String {
+        format!("{}/_/", self.issuer.trim_end_matches("/oidc"))
+    }
 }
 
 /// XDG by hand rather than via `directories`, which would return
@@ -135,6 +151,14 @@ mod tests {
         assert_eq!(c.issuer, "http://127.0.0.1:9500/oidc");
         assert_eq!(c.jwks_uri(), "http://127.0.0.1:9500/oidc/jwks");
         assert_eq!(c.token_endpoint(), "http://127.0.0.1:9500/oidc/token");
+        assert_eq!(
+            c.authorization_endpoint(),
+            "http://127.0.0.1:9500/oidc/authorize"
+        );
+        assert_eq!(c.userinfo_endpoint(), "http://127.0.0.1:9500/oidc/userinfo");
+        // The banner prints this and criterion 25 fetches it, so the `/oidc`
+        // segment has to come back off.
+        assert_eq!(c.ui_url(), "http://127.0.0.1:9500/_/");
     }
 
     #[test]
@@ -174,6 +198,11 @@ mod tests {
             Config::resolve(env(&[("HOME", "/home/dev"), ("LANYARD_BIND", "0.0.0.0")])).unwrap();
         assert_eq!(c.listen_addr(), "0.0.0.0:9500");
         assert_eq!(c.issuer, "http://127.0.0.1:9500/oidc");
+        assert_eq!(
+            c.ui_url(),
+            "http://127.0.0.1:9500/_/",
+            "the banner must print a URL that opens, not the wildcard bind"
+        );
     }
 
     #[test]

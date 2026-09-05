@@ -30,6 +30,11 @@ rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# The loopback check on `redirect_uri` is lanyard's single security boundary, so
+# it gets a real URL parser rather than a hand-rolled one. Already in the lock
+# via `reqwest`, so it costs nothing — and its IDNA normalization is what makes a
+# Cyrillic homograph of `localhost` punycode to `xn--…` and fail the comparison.
+url = "2"
 serde_norway = "0.9.42"
 serde_urlencoded = "0.7"
 # The CLI performs a real `client_credentials` grant rather than signing locally,
@@ -39,4 +44,9 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "f
 
 [dev-dependencies]
 tempfile = "3.27.0"
+url = "2"
+sha2 = { version = "0.10", features = ["oid"] }
+# The browser-flow tests need a cookie jar, and the binary does not: the feature
+# is added here so `lanyard` itself never links a cookie store it has no use for.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "cookies"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

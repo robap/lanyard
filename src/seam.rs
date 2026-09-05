@@ -23,6 +23,7 @@ use serde_json::{json, Map, Value};
 use crate::app::SharedState;
 use crate::oidc::flaw::Flaw;
 use crate::oidc::issue::{self, DEFAULT_TTL};
+use crate::oidc::scope::ClaimFilter;
 
 pub fn routes() -> Router<SharedState> {
     Router::new()
@@ -94,6 +95,9 @@ async fn token(
         &overrides,
         ttl,
         flaw,
+        // The seam's contract is "the body is the claims": filtering it would
+        // make a posted claim vanish for a reason the body never mentioned.
+        &ClaimFilter::Unfiltered,
     ) {
         Ok(issued) => {
             let mut response = json!({ "token": issued.token, "claims": issued.claims });

@@ -10,11 +10,36 @@ use serde_json::{Map, Value};
 use crate::keys::SigningKey;
 use crate::oidc::flaw::{self, Flaw};
 use crate::oidc::jws;
+use crate::oidc::scope::ClaimFilter;
 use crate::persona::Persona;
 
 /// Access tokens are 60 seconds by default. Long-lived dev tokens mean the
 /// refresh path never runs locally (CONCEPT §6).
 pub const DEFAULT_TTL: u64 = 60;
+
+/// **The one lifetime in this project that is not 60 seconds, and it is
+/// deliberate.**
+///
+/// An access token is a credential and its short life is the entire point of
+/// CONCEPT §6 — a 60-second access token that gets rejected is lanyard working.
+/// An ID token is an authentication *receipt*: consumed once at login and then
+/// exchanged for the RP's own cookie. A 60-second one makes `oidc-client-ts`
+/// consider the user expired seconds after signing in, which tests Phase 9's
+/// renew path rather than this phase's login path. Five minutes is still
+/// aggressive by any production standard.
+pub const ID_TOKEN_TTL: u64 = 300;
+
+/// OIDC Core §3.1.3.6's `at_hash` / `c_hash`: base64url of the **leftmost 128
+/// bits** of the SHA-256 of the ASCII of the value.
+///
+/// 128 bits because the hash length is half the digest of the signature
+/// algorithm's hash, and RS256 hashes with SHA-256. Emitting a full digest is
+/// the classic way to produce a hash every library rejects.
+pub fn half_hash(value: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    crate::b64::encode(&digest[..16])
+}
 
 /// A minted token, the exact claims that were signed, and the moment they were
 /// minted at.
@@ -36,9 +61,19 @@ pub fn issue(
     overrides: &Map<String, Value>,
     ttl: u64,
     flaw: Option<Flaw>,
+    filter: &ClaimFilter,
 ) -> Result<Issued, String> {
     let issued_at = unix_now();
-    let claims = claims_at(issued_at, issuer, persona, overrides, ttl, &new_jti(), flaw);
+    let claims = claims_at(
+        issued_at,
+        issuer,
+        persona,
+        overrides,
+        ttl,
+        &new_jti(),
+        flaw,
+        filter,
+    );
     let token = jws::sign(key, &claims, flaw)?;
     Ok(Issued {
         token,
@@ -49,6 +84,17 @@ pub fn issue(
 
 /// The claim set, as a pure function of its inputs so the time-dependent parts
 /// are testable.
+///
+/// Eight arguments, two over clippy's threshold, and deliberately not bundled
+/// into a parameters struct. This is the one function every token in the project
+/// comes out of (north star 3), and its argument list *is* the contract: a new
+/// caller has to answer "which persona, which overrides, how long, flawed how,
+/// filtered how" before it can call. A struct with `Default` would let a caller
+/// skip a question, and the question it would skip is the filter — which is
+/// precisely the one whose wrong answer leaks a persona's email into a token
+/// that did not ask for it. `now` and `jti` are the impurity, injected so the
+/// rest is testable.
+#[allow(clippy::too_many_arguments)]
 pub fn claims_at(
     now: u64,
     issuer: &str,
@@ -57,34 +103,16 @@ pub fn claims_at(
     ttl: u64,
     jti: &str,
     flaw: Option<Flaw>,
+    filter: &ClaimFilter,
 ) -> Map<String, Value> {
-    let mut claims = Map::new();
-
-    // 1. The persona, mapped per the spec's table.
-    if let Some(p) = persona {
-        claims.insert("sub".into(), Value::from(p.id.clone()));
-
-        if let Some(email) = &p.email {
-            claims.insert("email".into(), Value::from(email.clone()));
-            claims.insert("email_verified".into(), Value::Bool(true));
-        }
-        // `preferred_username` and `name` are both `profile`-scope claims, so
-        // they travel together: a persona with no display identity has no
-        // username to prefer. This is what keeps `nobody` carrying `sub` and the
-        // registered claims and nothing else (CONCEPT §3) — a picker or header
-        // that renders `preferred_username` must actually break on `nobody`,
-        // which is the entire reason that persona exists.
-        if let Some(name) = &p.name {
-            claims.insert("name".into(), Value::from(name.clone()));
-            claims.insert("preferred_username".into(), Value::from(p.id.clone()));
-        }
-        if !p.roles.is_empty() {
-            claims.insert("roles".into(), Value::from(p.roles.clone()));
-        }
-        for (key, value) in &p.attributes {
-            claims.insert(key.clone(), value.clone());
-        }
-    }
+    // 1. The persona, mapped per the spec's table and filtered by scope.
+    //    **Step 1 only.** The filter never reaches the registered claims below
+    //    and never reaches the overrides: `email` scope decides whether Ada's
+    //    address is in the token, not whether the token has an `iss`.
+    let mut claims = match persona {
+        Some(p) => persona_claims(p, filter),
+        None => Map::new(),
+    };
 
     // 2. The registered claims. After attributes, so an attribute cannot quietly
     //    move the issuer — the body is the documented override channel.
@@ -135,6 +163,49 @@ pub fn claims_at(
         Some(Flaw::BadSignature) | Some(Flaw::AlgNone) | Some(Flaw::UnknownKid) | None => {}
     }
 
+    claims
+}
+
+/// The persona → claims table, and the only copy of it.
+///
+/// Extracted so `/userinfo` can read the same table without minting anything.
+/// A second mapping written next to the UserInfo handler is exactly the drift
+/// north star 3 exists to prevent — and it would be invisible until the day an
+/// RP compared the ID token against the UserInfo response.
+pub fn persona_claims(p: &Persona, filter: &ClaimFilter) -> Map<String, Value> {
+    let mut claims = Map::new();
+    let mut put = |key: &str, value: Value| {
+        if filter.allows(key) {
+            claims.insert(key.to_string(), value);
+        }
+    };
+
+    put("sub", Value::from(p.id.clone()));
+
+    if let Some(email) = &p.email {
+        put("email", Value::from(email.clone()));
+        put("email_verified", Value::Bool(true));
+    }
+    // `preferred_username` and `name` are both `profile`-scope claims, so
+    // they travel together: a persona with no display identity has no
+    // username to prefer. This is what keeps `nobody` carrying `sub` and the
+    // registered claims and nothing else (CONCEPT §3) — a picker or header
+    // that renders `preferred_username` must actually break on `nobody`,
+    // which is the entire reason that persona exists.
+    //
+    // It is also why the filter must not panic or 500 on an absent claim:
+    // `nobody` under `openid email profile` yields `sub` and nothing else, and
+    // that login still has to succeed.
+    if let Some(name) = &p.name {
+        put("name", Value::from(name.clone()));
+        put("preferred_username", Value::from(p.id.clone()));
+    }
+    if !p.roles.is_empty() {
+        put("roles", Value::from(p.roles.clone()));
+    }
+    for (key, value) in &p.attributes {
+        put(key, value.clone());
+    }
     claims
 }
 

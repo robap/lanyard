@@ -8,6 +8,7 @@ use lanyard_cli::app::{self, AppState};
 use lanyard_cli::config::Config;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
+use lanyard_cli::store::Stores;
 
 /// A server on an ephemeral port, with the issuer still the canonical fixed
 /// string — the issuer never follows the address lanyard happens to be reached
@@ -27,6 +28,7 @@ async fn spawn_with(personas: Personas) -> String {
         config,
         key,
         personas,
+        stores: Stores::default(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -116,7 +118,6 @@ async fn discovery_advertises_only_what_exists() {
     assert_eq!(doc["issuer"], ISSUER);
     assert_eq!(doc["jwks_uri"], format!("{ISSUER}/jwks"));
     assert_eq!(doc["id_token_signing_alg_values_supported"][0], "RS256");
-    assert!(doc["response_types_supported"].is_array());
     assert!(doc["subject_types_supported"].is_array());
 
     // The document stays honest in both directions: it advertises the token
@@ -124,7 +125,33 @@ async fn discovery_advertises_only_what_exists() {
     assert_eq!(doc["token_endpoint"], format!("{ISSUER}/token"));
     assert_eq!(
         doc["grant_types_supported"],
-        serde_json::json!(["client_credentials"])
+        serde_json::json!(["client_credentials", "authorization_code"])
+    );
+
+    // Phase 4 implemented these two, so the document says so.
+    assert_eq!(doc["authorization_endpoint"], format!("{ISSUER}/authorize"));
+    assert_eq!(doc["userinfo_endpoint"], format!("{ISSUER}/userinfo"));
+    assert_eq!(
+        doc["code_challenge_methods_supported"],
+        serde_json::json!(["S256", "plain"])
+    );
+    assert_eq!(
+        doc["response_modes_supported"],
+        serde_json::json!(["query", "form_post"])
+    );
+    assert_eq!(
+        doc["scopes_supported"],
+        serde_json::json!(["openid", "email", "profile"])
+    );
+
+    // **Exactly `["code"]`.** Phase 1 wrote `["id_token", "code"]` when nothing
+    // implemented either; advertising `id_token` now would tell a .NET app that
+    // its default setting is supported and then reject it at request time.
+    assert_eq!(
+        doc["response_types_supported"],
+        serde_json::json!(["code"]),
+        "advertising a response type /authorize refuses is the fail-later failure \
+         this rule exists to prevent"
     );
     // All three are true, because none of them are checked.
     assert_eq!(
@@ -135,8 +162,6 @@ async fn discovery_advertises_only_what_exists() {
     // Honest, not aspirational: an advertised endpoint that 404s sends a client
     // down a path that fails later and further away.
     for unimplemented in [
-        "authorization_endpoint",
-        "userinfo_endpoint",
         "end_session_endpoint",
         "introspection_endpoint",
         "revocation_endpoint",

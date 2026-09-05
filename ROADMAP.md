@@ -183,15 +183,107 @@ This block goes in the README above the login screenshot. (CONCEPT §6)
 **Goal:** the endpoints SDKs probe for, and the ones missing from most mocks.
 
 - `refresh_token` grant.
-- `GET|POST /oidc/end_session` — RP-initiated logout.
+- `GET|POST /oidc/end_session` — RP-initiated logout, honouring
+  `post_logout_redirect_uri` and `id_token_hint`.
 - `POST /oidc/introspect`, `POST /oidc/revoke`.
-- CORS on `/oidc/token` and `/oidc/jwks` for any localhost origin.
+- ~~CORS on `/oidc/token` and `/oidc/jwks` for any localhost origin.~~ **Landed
+  in Phase 4**, in the minimum shape acceptance criterion 2 needed — that
+  criterion asks a browser SPA to complete a login, which is impossible
+  cross-origin without it. Phase 4's spec records the change.
+- **"Log out of lanyard" as a visible control on `/_/`**, not only as a protocol
+  endpoint. Today the picker can be told to *always ask* but the browser's
+  selection cannot be dropped at all, and there is no `/end_session` yet either:
+  the only ways to clear it are closing the browser or restarting the process.
 - "Expire this session now" control in the UI.
+
+**There are two sessions, and Phase 4 shipped no way to end either one.**
+Measured against `spikes/dotnet-web` after logging in as Ada:
+
+| Cookie deleted | What happens on the next `/secure` |
+|---|---|
+| `lanyard_session` only | Nothing observable. Still Ada, and the browser never reaches lanyard — the RP's own cookie satisfies the request |
+| The RP's cookie only | A round trip to lanyard, which still remembers Ada, so **no picker** and you are silently signed back in as the same person |
+| Both | The picker, at last |
+
+The middle row is what `spikes/dotnet-web`'s `/logout` does today: it clears the
+app's cookie and looks like it worked.
+
+### What "fully logged out" has to mean
+
+**One click in the app, both sessions gone, no manual cookie deletion.** This is
+RP-initiated logout, and it is a *browser redirect chain* rather than a
+back-channel call — `lanyard_session` lives in the browser, so only a top-level
+navigation carries it:
+
+1. The user clicks **Log out** in the app.
+2. The app drops its own cookie and `302`s to
+   `{end_session_endpoint}?id_token_hint=…&post_logout_redirect_uri=…&state=…`.
+3. lanyard drops `lanyard_session` and `302`s to the `post_logout_redirect_uri`.
+4. The user lands back on the app, signed out of both. The next visit to a
+   protected page shows **the picker**.
+
+FusionAuth is the reference for this being an ordinary thing a local provider
+offers rather than an enterprise feature: its OAuth logout endpoint takes the
+same `post_logout_redirect_uri` shape, and an application can be configured for
+how far the logout reaches.
+
+**lanyard has to build almost nothing on the client side.** All three spikes
+already ship the one-liner and are only waiting for the endpoint to exist:
+
+| Spike | The call |
+|---|---|
+| `dotnet-web` | `SignOutAsync` over both the cookie and OIDC schemes — `AddOpenIdConnect` builds the redirect itself |
+| `php-web` | `$oidc->signOut($idToken, $postLogoutRedirect)` |
+| `node-spa` | `mgr.signoutRedirect()` |
+
+Four decisions this forces, none of them obvious:
+
+- **`end_session_endpoint` must appear in discovery**, or .NET will not build the
+  redirect at all — it reads the URL from the document. That is the
+  advertise-only-what-exists rule cutting the other way for once: the endpoint
+  has to ship *and* be advertised in the same phase, or the .NET one-liner is
+  silently a no-op.
+- **`post_logout_redirect_uri` gets the same loopback check as `redirect_uri`.**
+  The one rejection now applies to a second parameter, for the same reason, and
+  the rejection is rendered rather than redirected for the same reason again.
+- **Does logging out of one app log you out of all of them?** lanyard's session
+  holds a selection *per `client_id`* — that is the whole multi-project property
+  — so `/end_session` from `billing-web` could drop just that selection or the
+  entire browser session including php-web's Mira. Every real IdP has one SSO
+  session and clears all of it, and diverging from production is the thing this
+  project exists not to do; **clear everything** is the default to beat. But it
+  means a logout in one app visibly logs you out of the other two, which is
+  exactly the demo in `spikes/README.md`, so it needs to be a decision on the
+  record rather than a side effect. A per-`client_id` variant, if it is wanted,
+  belongs on lanyard's own UI and not on the protocol endpoint.
+- **lanyard never shows a logout confirmation screen.** OIDC RP-Initiated Logout
+  says the OP *should* ask the user to confirm when there is no valid
+  `id_token_hint`. lanyard has no consent screen and this is the same argument:
+  a prompt nobody can automate past is a prompt in the way of a test.
+
+Adding the button means editing every web spike's page, which is the cheap
+moment to also make those pages **identical across stacks** — see
+[Phase 11](#phase-11--examples-and-the-readme). Doing it here costs one extra
+file; doing it later means editing every page twice.
 
 **Acceptance**
 
-- [ ] The .NET web app's sign-out reaches `/end_session` and returns to
-      `post_logout_redirect_uri` with the session actually gone.
+- [ ] **One click, both sessions, in all three web spikes.** Click **Log out**;
+      the browser goes app → `/oidc/end_session` → back to the app; the next
+      visit to the protected page shows **the persona picker**, not a silent
+      re-login as the same person. No cookie is deleted by hand at any point,
+      and the redirect chain is visible in the network tab.
+- [ ] `end_session_endpoint` is in the discovery document and .NET builds the
+      redirect from it with no URL hard-coded in the app.
+- [ ] `post_logout_redirect_uri=https://evil.example.com/` is refused the same
+      way a bad `redirect_uri` is: `400` rendered at lanyard, no `Location`.
+- [ ] Whichever answer the per-`client_id` question gets, it is observable:
+      log in to two apps as two people, log out of one, and the other's state is
+      whatever the decision says it should be — recorded in the spec, not
+      discovered in a browser.
+- [ ] Clearing `lanyard_session` by hand and revisiting a protected page still
+      does nothing visible, and the README says why rather than leaving it as a
+      surprise.
 - [ ] The `oidc-client-ts` SPA refreshes an expired access token without a
       redirect.
 - [ ] A browser SPA on `http://localhost:3000` fetches `/oidc/jwks` with no CORS
@@ -322,6 +414,32 @@ when I…". (CONCEPT §11, §13)
   anyone to a framework.
 - `examples/dotnet-web/` second — the one most likely to need
   `RequireHttpsMetadata = false`, and we will have debugged it anyway.
+- **One shared page, rendered by every stack.** Every web example — and every web
+  spike it grows out of — serves byte-identical HTML and CSS: the same landing
+  page, the same "sign in" and "log out" buttons in the same places, the same
+  claim table. Only the server-side plumbing differs.
+
+  Today `spikes/dotnet-web` renders `text/plain` from a `Results.Text` and
+  `spikes/php-web` echoes three lines from a `header('Content-Type: text/plain')`,
+  so comparing what two stacks actually did means reading past two different
+  presentations of it. **That is the whole reason to make them identical**: when
+  the page is a constant, every visible difference between .NET and PHP is a
+  difference in the stack, which is the question these apps exist to answer.
+  It also makes the Phase 11 screenshot and GIF reusable across examples instead
+  of one-per-framework.
+
+  Cheapest shape that gets it: one `shared/` directory holding the page as a
+  template with a couple of substitution points (the claim rows, the signed-in
+  state), copied or symlinked into each example, with a CI check that the
+  rendered output matches across stacks. `node-spa` fills the same template
+  client-side rather than server-side — the markup can still match, and where it
+  cannot, that difference is itself worth seeing.
+
+  **Start this in Phase 5**, which has to touch every one of these pages anyway
+  to add the logout button. A down payment already exists: `dotnet-web` and
+  `php-web` share a landing page that is identical apart from one explanatory
+  sentence, added when both spikes stopped auto-redirecting. The claim views are
+  still two different formats, and that is the part left to do.
 - Each ships a `test.sh` exercising the failure tokens: good → 200,
   expired → 401, wrong audience → 401, no token → 401.
 - CI matrix, one job per example. That makes `examples/` an executable
@@ -337,6 +455,8 @@ when I…". (CONCEPT §11, §13)
 - [ ] `git clone && cd examples/curl && ./test.sh` passes against a lanyard the
       operator installed 60 seconds earlier, with no configuration between.
 - [ ] `examples/dotnet-web` runs with two commands and completes a login.
+- [ ] Two web examples on different stacks, screenshotted side by side, are
+      indistinguishable apart from the persona and the port.
 - [ ] Both example jobs green in CI.
 
 **→ v1.0**

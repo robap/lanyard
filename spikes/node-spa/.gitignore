@@ -1,0 +1,9 @@
+# Nothing in this spike is generated: there is no build step, no `npm install`
+# and no `node` on the path at any point.
+#
+# `vendor/` holds the published `oidc-client-ts` browser bundle, committed on
+# purpose so the spike runs with no network and so nothing in this repository's
+# login path reaches a CDN. Convention says a directory with that name is build
+# output; here it is source, and this negation says so out loud — and keeps it
+# tracked if a `vendor/` rule ever appears further up the tree.
+!vendor/

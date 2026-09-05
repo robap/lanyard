@@ -83,6 +83,71 @@ pub fn sign(
     Ok(format!("{signing_input}.{}", b64::encode(signature)))
 }
 
+/// Verify a token as **lanyard's own**: signature, `iss`, and `exp`, and
+/// nothing else.
+///
+/// `/oidc/userinfo` is the only caller. It does not check `aud`, because there
+/// is no client to check it against — a bearer token arriving at UserInfo was
+/// issued for whatever API the request named, and UserInfo is not that API. It
+/// does not check `nbf` either: lanyard never issues a future `nbf` except
+/// under `flaw=expired`, which moves `exp` too.
+///
+/// **This is the second place lanyard says no**, and the reason is PKCE's: an
+/// app that reads `/userinfo` with an expired token has a bug, and a mock that
+/// answers anyway hides it.
+pub fn verify(key: &SigningKey, issuer: &str, token: &str) -> Result<Map<String, Value>, String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("the token is not a compact JWS of three segments".to_string());
+    }
+
+    let header: Value = serde_json::from_slice(
+        &b64::decode(parts[0]).map_err(|_| "the token header is not base64url".to_string())?,
+    )
+    .map_err(|_| "the token header is not JSON".to_string())?;
+
+    // An unsecured JWT is refused by name rather than by falling through a
+    // signature check it would never reach. Phase 3 can mint one on purpose,
+    // and this endpoint is where it should stop.
+    match header["alg"].as_str() {
+        Some("RS256") => {}
+        Some("none") => return Err("the token is unsigned (alg: none)".to_string()),
+        Some(other) => return Err(format!("the token is signed with {other}, not RS256")),
+        None => return Err("the token header names no alg".to_string()),
+    }
+
+    let signature =
+        b64::decode(parts[2]).map_err(|_| "the token signature is not base64url".to_string())?;
+    let digest = Sha256::digest(format!("{}.{}", parts[0], parts[1]).as_bytes());
+    key.private()
+        .to_public_key()
+        .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest, &signature)
+        .map_err(|_| "the token signature does not verify against lanyard's key".to_string())?;
+
+    let claims: Map<String, Value> = serde_json::from_slice(
+        &b64::decode(parts[1]).map_err(|_| "the token payload is not base64url".to_string())?,
+    )
+    .map_err(|_| "the token payload is not a JSON object".to_string())?;
+
+    if claims.get("iss").and_then(Value::as_str) != Some(issuer) {
+        return Err(format!(
+            "the token was issued by someone other than {issuer}"
+        ));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match claims.get("exp").and_then(Value::as_u64) {
+        Some(exp) if exp > now => {}
+        Some(_) => return Err("the token has expired".to_string()),
+        None => return Err("the token has no exp".to_string()),
+    }
+
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +318,113 @@ mod tests {
                 .is_err(),
             "the whole point is that this does not verify"
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+    use crate::keys::DEFAULT_DEV_KEY_PEM;
+
+    const ISSUER: &str = "http://127.0.0.1:9500/oidc";
+
+    fn key() -> SigningKey {
+        SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap()
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn token_with(iss: &str, exp: u64, flaw: Option<Flaw>) -> String {
+        let mut claims = Map::new();
+        claims.insert("sub".into(), Value::from("ada"));
+        claims.insert("iss".into(), Value::from(iss));
+        claims.insert("exp".into(), Value::from(exp));
+        sign(&key(), &claims, flaw).unwrap()
+    }
+
+    #[test]
+    fn a_good_token_verifies_and_hands_back_its_claims() {
+        let claims = verify(&key(), ISSUER, &token_with(ISSUER, now() + 60, None)).unwrap();
+        assert_eq!(claims["sub"], "ada");
+    }
+
+    /// The reason this endpoint says no at all: a mock that answers an expired
+    /// token hides the bug in the app that presented it.
+    #[test]
+    fn an_expired_token_is_refused_and_says_so() {
+        let err = verify(&key(), ISSUER, &token_with(ISSUER, now() - 1, None)).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    #[test]
+    fn a_token_from_another_issuer_is_refused() {
+        let err = verify(
+            &key(),
+            ISSUER,
+            &token_with("https://elsewhere.test", now() + 60, None),
+        )
+        .unwrap_err();
+        assert!(err.contains("issued by someone other than"), "{err}");
+    }
+
+    /// Phase 3's three signature-shaped flaws, meeting the one endpoint that
+    /// checks signatures. Each is refused, and each says which thing was wrong.
+    #[test]
+    fn the_flawed_tokens_are_refused_by_name() {
+        let expired = sign_flawed(Flaw::Expired);
+        assert!(verify(&key(), ISSUER, &expired)
+            .unwrap_err()
+            .contains("expired"));
+
+        let unsigned = sign_flawed(Flaw::AlgNone);
+        assert!(verify(&key(), ISSUER, &unsigned)
+            .unwrap_err()
+            .contains("unsigned"));
+
+        let broken = sign_flawed(Flaw::BadSignature);
+        assert!(verify(&key(), ISSUER, &broken)
+            .unwrap_err()
+            .contains("does not verify"));
+
+        let wrong_iss = sign_flawed(Flaw::WrongIss);
+        assert!(verify(&key(), ISSUER, &wrong_iss)
+            .unwrap_err()
+            .contains("issued by someone"));
+    }
+
+    /// A real signature under a `kid` nobody has still verifies here, because
+    /// lanyard has exactly one key and looks nothing up. That is honest rather
+    /// than a gap: `--unknown-kid` is a test of *the relying party's* key
+    /// handling, and lanyard is not the relying party.
+    #[test]
+    fn an_unknown_kid_still_verifies_because_the_signature_is_real() {
+        let token = sign_flawed(Flaw::UnknownKid);
+        assert!(verify(&key(), ISSUER, &token).is_ok());
+    }
+
+    fn sign_flawed(flaw: Flaw) -> String {
+        let claims = crate::oidc::issue::claims_at(
+            now(),
+            ISSUER,
+            None,
+            &Map::new(),
+            60,
+            "test-jti",
+            Some(flaw),
+            &crate::oidc::scope::ClaimFilter::Unfiltered,
+        );
+        sign(&key(), &claims, Some(flaw)).unwrap()
+    }
+
+    #[test]
+    fn something_that_is_not_a_token_is_refused_rather_than_panicking() {
+        for garbage in ["", "abc", "a.b", "a.b.c.d", "!!!.!!!.!!!"] {
+            assert!(verify(&key(), ISSUER, garbage).is_err(), "{garbage:?}");
+        }
     }
 }

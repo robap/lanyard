@@ -1,0 +1,3 @@
+# `composer install` output. `composer.json` and `composer.lock` are committed,
+# so this is reproducible — see the README.
+vendor/

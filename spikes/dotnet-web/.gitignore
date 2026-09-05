@@ -1,0 +1,3 @@
+# `dotnet build` output. Everything else in this directory is source.
+bin/
+obj/
