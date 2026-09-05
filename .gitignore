@@ -16,6 +16,10 @@ target
 # Throwaway spike apps (Phase 0 validation). Findings live in docs/, the apps do not.
 spikes/
 
+# The `jose` verification harness. Node verifies tokens; it never builds them.
+scripts/node_modules/
+scripts/package-lock.json
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

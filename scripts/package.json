@@ -1,0 +1,9 @@
+{
+  "name": "lanyard-verify",
+  "private": true,
+  "type": "module",
+  "description": "Verification-only harness. Node is never a build or runtime dependency of lanyard — north star 5 is a single static binary. This exists so tokens are checked by a real JWT library rather than by lanyard agreeing with itself.",
+  "dependencies": {
+    "jose": "^6.0.0"
+  }
+}

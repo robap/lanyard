@@ -418,7 +418,7 @@ For a tool with a UI, the screenshot answers "what is this" in about 400 millise
 
 ```
 $ lanyard serve
-  Issuer  → http://127.0.0.1:9500
+  Issuer  → http://127.0.0.1:9500/oidc
   Web UI  → http://127.0.0.1:9500/_/
 
 $ curl -H "Authorization: Bearer $(lanyard token --as ada --aud billing-api)" \
