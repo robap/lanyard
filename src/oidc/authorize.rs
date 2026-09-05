@@ -149,9 +149,10 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     // `prompt=none` is the request not to.
     if request.prompt == Some(Prompt::None) {
         return match usable.and_then(|selection| resolve(state, &selection)) {
-            Some((persona, auth_time)) => {
-                with_optional_cookie(complete(state, request, persona, auth_time), session_id)
-            }
+            Some((persona, auth_time)) => with_optional_cookie(
+                complete(state, request, persona, auth_time, session_id.clone()),
+                session_id,
+            ),
             None => redirect_error(
                 &request.redirect_uri,
                 request.state.as_deref(),
@@ -163,7 +164,10 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     }
 
     if let Some((persona, auth_time)) = usable.and_then(|selection| resolve(state, &selection)) {
-        return with_optional_cookie(complete(state, request, persona, auth_time), session_id);
+        return with_optional_cookie(
+            complete(state, request, persona, auth_time, session_id.clone()),
+            session_id,
+        );
     }
 
     let id = state
@@ -198,6 +202,7 @@ pub fn complete(
     request: AuthRequest,
     persona: Persona,
     auth_time: u64,
+    session_id: Option<String>,
 ) -> Response {
     let code = state
         .stores
@@ -208,6 +213,9 @@ pub fn complete(
             persona,
             auth_time,
             request: request.clone(),
+            // Carried through the code so a refresh token minted from it knows
+            // which browser session **Log out** revokes it with.
+            session_id,
         });
     deliver(&request, &code)
 }
@@ -248,15 +256,24 @@ fn parse(form: &Form) -> Result<AuthRequest, Rejection> {
         )
     })?;
 
-    let raw_redirect = form
-        .get("redirect_uri")
-        .ok_or_else(|| rejected("lanyard needs a redirect_uri", None, redirect_uri::RULE))?;
+    let raw_redirect = form.get("redirect_uri").ok_or_else(|| {
+        rejected(
+            "lanyard needs a redirect_uri",
+            None,
+            &redirect_uri::rule("redirect_uri"),
+        )
+    })?;
 
     // The parser's own sentence is carried into the page as well as the rule,
     // because it covers what the one-line rule does not — a URL that will not
     // parse at all, or a scheme rather than a host.
-    let redirect_uri = redirect_uri::check(raw_redirect)
-        .map_err(|message| rejected(&message, Some(raw_redirect), redirect_uri::RULE))?;
+    let redirect_uri = redirect_uri::check("redirect_uri", raw_redirect).map_err(|message| {
+        rejected(
+            &message,
+            Some(raw_redirect),
+            &redirect_uri::rule("redirect_uri"),
+        )
+    })?;
 
     // ---- everything below here redirects ----------------------------------
 
@@ -459,31 +476,20 @@ pub fn found(location: &str) -> Response {
     (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
 
-/// The rendered `400`: the browser stays on lanyard, there is **no `Location`
-/// header**, and the page names the value and states the rule.
-///
-/// The audience for this message is the developer reading it, which is exactly
-/// who needed it — the RP is never contacted, so "an error the RP can read" was
-/// never achievable for this class of failure.
+/// The rendered `400`, wrapped as a [`Rejection`]. The page itself is
+/// [`html::rejected_page`], which `/oidc/end_session` renders too — the one
+/// rejection has one look as well as one function.
 fn rejected(headline: &str, value: Option<&str>, rule: &str) -> Rejection {
-    let named = match value {
-        Some(value) => format!("<p><code>{}</code></p>\n", html::escape(value)),
-        None => String::new(),
-    };
-    let body = format!(
-        "<div class=\"warn\">\n\
-         <h1>{}</h1>\n{named}\
-         <p>{}</p>\n\
-         </div>\n\
-         <p class=\"lede\">Nothing was sent to that address. RFC 6749 §4.1.2.1 says an \
-         authorization server must not redirect an error to a <code>redirect_uri</code> it \
-         has not accepted, and this is the one thing lanyard does not accept.</p>\n\
-         <footer>lanyard · <a href=\"/_/\">persona picker</a></footer>\n",
-        html::escape(headline),
-        html::escape(rule),
-    );
-    Rejection::Rendered(Box::new(html::html(
-        StatusCode::BAD_REQUEST,
-        html::page("lanyard — request rejected", &body),
+    Rejection::Rendered(Box::new(html::rejected_page(
+        headline,
+        value,
+        rule,
+        // RFC 6749 §4.1.2.1: an authorization server must not redirect an error
+        // to a `redirect_uri` it has not accepted. Redirecting to an address you
+        // have just decided not to trust is what would make the boundary
+        // decorative.
+        "Nothing was sent to that address. RFC 6749 §4.1.2.1 says an authorization \
+         server must not redirect an error to a redirect_uri it has not accepted, and \
+         this is the one thing lanyard does not accept.",
     )))
 }

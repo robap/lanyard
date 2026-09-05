@@ -1,0 +1,9 @@
+The login chain, unchanged by Phase 5 except that /secure now redirects to /.
+
+GET  302  http://localhost:5000/secure
+GET  302  http://127.0.0.1:9500/oidc/authorize?client_id=billing-web&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fsignin-oidc&response_type=code&scope=openid%20profile%20email&code_challenge=tpePYsc1BSzY3JhVNlJsOWMGRGkDpQEarGsSGgyRuww&code_challenge_method=S256&response_mode=form_post&nonce=639241981507506477.ODUzOGIzZTEtMTE0Ny00YjU1LTk3Y2EtMDViZDc1ZTQ3OWEzZTE1MTU2MDgtYmNmMS00N2JkLThlZjgtZWQ2ZThkNjc0NjI5&state=CfDJ8BD7n2BUi_xDlN-Fct7dgfHhsJiZuYk1I36kEbI8l8ol_YngOuxs-5hY2jNfZaUlERwuzzacKqcAZM7hFXKOaVTc-SEt0NQgqUc9OcnUm5t_2oxHalsyLMOF4o1U_JCQy_QbaCmLp8VPW4xMpm6eu638SqjC3F8coXNTrxNqNhJ2azuftkMPuDWcznS1am3JDK-v1mcnZdUQF1su3XvyP0B8hCNDuVAjFVVBY8GzQP_VzhtI10knLMf7QLY8oVzD3JZOTQXpUMa5c95JYyKf5ddr4dRWykj4D9Ip-maseMGidJUz8fTdr3SLRBKRlCiAhM04Z2PI9kf9CwRjUciV7xfG8M4EU0AopVuwQknyIN7rRrkYEZSI94KuyWQiZJM_pw&x-client-SKU=ID_NET10_0&x-client-ver=8.19.2.0
+GET  200  http://127.0.0.1:9500/_/?req=11ef188de408424eafab83d149260aa8
+POST 200  http://127.0.0.1:9500/_/pick
+POST 302  http://localhost:5000/signin-oidc
+GET  302  http://localhost:5000/secure
+GET  200  http://localhost:5000/

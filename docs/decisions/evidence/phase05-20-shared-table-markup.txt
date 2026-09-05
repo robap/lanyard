@@ -1,0 +1,25 @@
+Criterion 27 — the claim view, as each stack actually rendered it.
+The table shell comes from spikes/shared/page.html; each stack supplies only
+the rows. The claim ORDERS differ, and that difference is a finding rather
+than a defect in the page.
+
+dotnet-web: 9 rows
+  shell: <table class="claims">
+    <thead><tr><th>claim</th><th>value</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  row:   <tr>…<td class="k">…</td>…<td class="v">…</td>…</tr>
+
+php-web: 3 rows
+  shell: <table class="claims">
+    <thead><tr><th>claim</th><th>value</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  row:   <tr>…<td class="k">…</td>…<td class="v">…</td>…</tr>
+
+node-spa: 11 rows
+  shell: <table class="claims">
+    <thead><tr><th>claim</th><th>value</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  row:   <tr>…<td class="k">…</td>…<td class="v">…</td>…</tr>

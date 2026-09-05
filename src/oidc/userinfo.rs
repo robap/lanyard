@@ -59,6 +59,18 @@ async fn userinfo(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         Err(message) => return unauthorized(&message),
     };
 
+    // **The same revocation set `/introspect` reads.** `/introspect` answering
+    // `active: false` while this endpoint handed over claims would be lanyard
+    // disagreeing with itself, and it is the same argument that made an expired
+    // token a `401`: an app reading UserInfo with a dead token has a bug.
+    let jti = claims
+        .get("jti")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if crate::oidc::revocation::is_revoked(&state, jti) {
+        return unauthorized("that token has been revoked");
+    }
+
     let Some(sub) = claims.get("sub").and_then(Value::as_str) else {
         return unauthorized("the token has no sub, so it identifies nobody");
     };

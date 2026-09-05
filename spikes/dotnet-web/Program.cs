@@ -34,6 +34,8 @@ builder.Services
         if (Keep("ClientId")) options.ClientId = "billing-web";
         if (Keep("ClientSecret")) options.ClientSecret = "unchecked";
         if (Keep("ResponseType")) options.ResponseType = "code";
+        // Also what makes `id_token_hint` reach `/oidc/end_session`: the handler
+        // can only send a hint it kept.
         if (Keep("SaveTokens")) options.SaveTokens = true;
         if (Keep("ScopeEmail")) options.Scope.Add("email");
         if (Keep("ScopeProfile")) options.Scope.Add("profile");
@@ -62,6 +64,11 @@ app.Use(async (context, next) =>
 app.UseAuthentication();
 app.UseAuthorization();
 
+// Read on every request rather than cached, so editing the shared page and
+// reloading the browser shows the edit — which is what makes it worth having
+// one file rather than three.
+var sharedPage = Path.Combine(app.Environment.ContentRootPath, "..", "shared", "page.html");
+
 // **The landing page does not redirect.** Hitting a protected page and being
 // bounced straight to the provider is what a real app does, and it is also what
 // makes the flow impossible to follow the first time: the browser has already
@@ -76,79 +83,52 @@ app.MapGet("/", (ClaimsPrincipal user) =>
               ?? user.FindFirst(ClaimTypes.NameIdentifier)?.Value
               ?? "somebody";
 
-    var body = signedIn
-        ? $"""
-            <p class="state">Signed in as <strong>{WebUtility.HtmlEncode(who)}</strong>.</p>
-            <p>
-              <a class="button" href="/secure">View my claims</a>
-              <a class="button secondary" href="/logout">Log out</a>
-            </p>
-            <p class="note">
-              "Log out" clears this app's cookie only — lanyard still remembers you,
-              so signing in again will not show the picker. Full logout needs
-              <code>/oidc/end_session</code>, which is roadmap Phase 5.
-            </p>
-          """
-        : """
-            <p class="state">Not signed in.</p>
-            <p><a class="button" href="/secure">Log in with lanyard</a></p>
-            <p class="note">
-              That link goes to a page marked <code>[Authorize]</code>. ASP.NET Core
-              turns the 401 into a redirect to lanyard, lanyard shows you a list of
-              people, and you come back here signed in.
-            </p>
-          """;
+    var rows = signedIn
+        ? string.Concat(user.Claims.Select(c =>
+            $"<tr><td class=\"k\">{WebUtility.HtmlEncode(c.Type)}</td>"
+            + $"<td class=\"v\">{WebUtility.HtmlEncode(c.Value)}</td></tr>"))
+        : "";
 
-    return Results.Content(Page("dotnet-web", body), "text/html");
+    return Results.Content(Page("dotnet-web", signedIn, signedIn ? who : "", rows), "text/html");
+});
+
+// The login. `[Authorize]` with no principal is a 401, which the OpenID Connect
+// handler turns into the redirect to lanyard — so this route *is* the login
+// button's destination, and there is no lanyard URL anywhere in this file.
+app.MapGet("/secure", [Authorize] () => Results.Redirect("/"));
+
+// **The real log-out, and it is one line of ours.** `SignOutAsync` over both
+// schemes: the cookie scheme drops this application's own cookie, and the OIDC
+// scheme builds the redirect to lanyard's `end_session_endpoint` — a URL it
+// reads out of the discovery document, adding `id_token_hint` because
+// `SaveTokens` kept one and using its own `SignedOutCallbackPath` as the
+// `post_logout_redirect_uri`. Nothing here names lanyard.
+app.MapGet("/logout", async (HttpContext ctx) =>
+{
+    await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    await ctx.SignOutAsync(OpenIdConnectDefaults.AuthenticationScheme,
+        new AuthenticationProperties { RedirectUri = "/" });
 });
 
 // Sign out of this app only, without touching lanyard's own session — which is
-// how you observe that lanyard remembers the persona per client_id.
-app.MapGet("/logout", async (HttpContext ctx) =>
+// how you observe that lanyard remembers the persona per client_id, and what
+// makes the two-sessions problem visible rather than theoretical.
+app.MapGet("/logout-local", async (HttpContext ctx) =>
 {
     await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
     return Results.Redirect("/");
 });
 
-app.MapGet("/secure", [Authorize] (ClaimsPrincipal user) =>
-{
-    var email = user.FindFirst("email")?.Value
-                ?? user.FindFirst(ClaimTypes.Email)?.Value
-                ?? "(no email claim)";
-    var claims = string.Join("\n", user.Claims.Select(c => $"  {c.Type} = {c.Value}"));
-    return Results.Text($"email: {email}\n\nall claims:\n{claims}");
-});
-
 app.Run();
 
-// A deliberately plain page shell, kept close to `php-web`'s so the two apps look
-// like the same app. Unifying them properly — one template, every stack — is
-// roadmap Phase 11.
-static string Page(string title, string body) => $$"""
-    <!doctype html>
-    <html lang="en">
-    <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{title}}</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
-             max-width: 36rem; margin: 4rem auto; padding: 0 1rem; }
-      h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
-      .state { font-size: 1.05rem; }
-      .button { display: inline-block; padding: .55rem 1rem; margin: .25rem .4rem .25rem 0;
-                border-radius: 7px; background: #2f5bd7; color: #fff;
-                text-decoration: none; font-weight: 600; }
-      .button.secondary { background: transparent; color: inherit;
-                          border: 1px solid currentColor; font-weight: 400; }
-      .note { color: #666; font-size: .875rem; margin-top: 2rem; }
-      code { font-family: ui-monospace, monospace; font-size: .875em; }
-    </style>
-    </head>
-    <body>
-    <h1>{{title}}</h1>
-    {{body}}
-    </body>
-    </html>
-    """;
+// **One page, three stacks.** `spikes/shared/page.html` is read at runtime, not
+// copied and not generated, so this application and `php-web` cannot render
+// differently by accident — and every visible difference between them is a
+// difference in the stack, which is the question these spikes exist to answer.
+string Page(string app, bool signedIn, string who, string claimRows) =>
+    File.ReadAllText(sharedPage)
+        .Replace("{{APP}}", WebUtility.HtmlEncode(app))
+        .Replace("{{WHO}}", WebUtility.HtmlEncode(who))
+        .Replace("{{SIGNED_IN}}", signedIn ? "" : "hidden")
+        .Replace("{{SIGNED_OUT}}", signedIn ? "hidden" : "")
+        .Replace("{{CLAIM_ROWS}}", claimRows);

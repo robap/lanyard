@@ -35,6 +35,7 @@ pub async fn spawn_with_short_lived_codes() -> String {
         Stores::with_ttls(
             std::time::Duration::from_secs(300),
             std::time::Duration::ZERO,
+            lanyard_cli::store::REFRESH_TTL,
         ),
     )
     .await

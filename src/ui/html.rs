@@ -50,6 +50,36 @@ pub fn page(title: &str, body: &str) -> String {
     )
 }
 
+/// **The one rejection's page**, rendered at lanyard with no `Location` header,
+/// naming the offending value and stating the rule in one sentence.
+///
+/// Both callers are the same boundary pointed at a different parameter:
+/// `/oidc/authorize`'s `redirect_uri` and `/oidc/end_session`'s
+/// `post_logout_redirect_uri`. The audience is the developer reading it, which
+/// is exactly who needed it — the RP is never contacted, so "an error the RP can
+/// read" was never achievable for this class of failure.
+pub fn rejected_page(headline: &str, value: Option<&str>, rule: &str, reason: &str) -> Response {
+    let named = match value {
+        Some(value) => format!("<p><code>{}</code></p>\n", escape(value)),
+        None => String::new(),
+    };
+    let body = format!(
+        "<div class=\"warn\">\n\
+         <h1>{}</h1>\n{named}\
+         <p>{}</p>\n\
+         </div>\n\
+         <p class=\"lede\">{}</p>\n\
+         <footer>lanyard · <a href=\"/_/\">persona picker</a></footer>\n",
+        escape(headline),
+        escape(rule),
+        escape(reason),
+    );
+    html(
+        StatusCode::BAD_REQUEST,
+        page("lanyard — request rejected", &body),
+    )
+}
+
 /// `text/html` with the status the caller chose. Used for the picker and for
 /// the one rejection's rendered `400`.
 pub fn html(status: StatusCode, body: String) -> Response {

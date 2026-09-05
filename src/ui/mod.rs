@@ -22,6 +22,7 @@ use axum::Router;
 
 use crate::app::SharedState;
 use crate::oidc::authorize;
+use crate::oidc::revocation;
 use crate::oidc::token::Form;
 use crate::persona::Persona;
 use crate::session;
@@ -32,6 +33,14 @@ pub fn routes() -> Router<SharedState> {
         .route("/", get(picker))
         .route("/pick", post(pick))
         .route("/session", post(session_settings))
+        // Three plain `POST` forms, no JavaScript, same as everything else on
+        // this page. `SameSite=Lax` means a cross-site POST arrives without the
+        // cookie and therefore acts on no session, which is why none of them
+        // needs a CSRF token — the same reasoning Phase 4 recorded for
+        // `/_/pick`.
+        .route("/logout", post(logout))
+        .route("/forget", post(forget))
+        .route("/expire", post(expire))
 }
 
 // ------------------------------------------------------------ the picker --
@@ -44,15 +53,7 @@ pub async fn picker(
     RawQuery(query): RawQuery,
 ) -> Response {
     let form = Form::from_query(query.as_deref().unwrap_or_default());
-    let session_id = session::from_headers(&headers);
-    let always_ask = session_id.as_deref().is_some_and(|id| {
-        state
-            .stores
-            .sessions
-            .lock()
-            .expect("sessions")
-            .always_ask(id)
-    });
+    let browser = Browser::of(&state, session::from_headers(&headers).as_deref());
 
     let req = form.get("req");
     let pending = req.map(|id| {
@@ -76,7 +77,7 @@ pub async fn picker(
                      <p>An authorization request is held for five minutes, and lanyard \
                      holds them in memory, so either the five minutes ran out or lanyard \
                      was restarted. Start the login again from your application.</p>\n</div>\n{}",
-                    persona_list(&state, None, always_ask)
+                    persona_list(&state, None, &browser)
                 ),
             ),
         ),
@@ -84,24 +85,21 @@ pub async fn picker(
             StatusCode::OK,
             html::page(
                 "lanyard — pick a person",
-                &persona_list(&state, Some((id, &client_id)), always_ask),
+                &persona_list(&state, Some((id, &client_id)), &browser),
             ),
         ),
         // The banner's `UI →` line lands here, so it has to be honest about
         // there being nothing to do.
         _ => html::html(
             StatusCode::OK,
-            html::page(
-                "lanyard — personas",
-                &persona_list(&state, None, always_ask),
-            ),
+            html::page("lanyard — personas", &persona_list(&state, None, &browser)),
         ),
     }
 }
 
 /// The list of people, as buttons when a login is waiting on one and as plain
 /// cards when nothing is.
-fn persona_list(state: &SharedState, req: Option<(&str, &str)>, always_ask: bool) -> String {
+fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browser) -> String {
     let mut out = String::new();
 
     match req {
@@ -123,7 +121,7 @@ fn persona_list(state: &SharedState, req: Option<(&str, &str)>, always_ask: bool
     }
 
     out.push_str(&mint_panel(req.map(|(id, _)| id)));
-    out.push_str(&always_ask_panel(req.map(|(id, _)| id), always_ask));
+    out.push_str(&this_browser_panel(state, req.map(|(id, _)| id), browser));
     out.push_str(
         "<footer>lanyard · sessions live in memory, so restarting lanyard logs \
          everybody out.</footer>\n",
@@ -200,37 +198,173 @@ fn mint_panel(req: Option<&str>) -> String {
     )
 }
 
-/// Its own little form, on both versions of the page, so the flag can be turned
-/// off without starting a login — and so that turning it on does not need
-/// JavaScript to also submit whichever persona form the human happens to be
-/// looking at.
-fn always_ask_panel(req: Option<&str>, always_ask: bool) -> String {
-    let checked = if always_ask { " checked" } else { "" };
-    let back = match req {
-        Some(req) => format!(
-            "<input type=\"hidden\" name=\"req\" value=\"{}\">\n",
-            html::escape(req)
-        ),
-        None => String::new(),
-    };
-    format!(
-        "<h2>This browser</h2>\n\
-         <form class=\"card\" method=\"post\" action=\"/_/session\">\n{back}\
+/// What the **This browser** panel renders: what this browser is signed in as,
+/// per `client_id`, and whether it has asked to be asked every time.
+///
+/// Read once, under one lock, before any page is built — the store has no async
+/// surface and no guard here crosses an `.await`.
+struct Browser {
+    always_ask: bool,
+    /// One entry per `client_id`, sorted, so the page does not reorder itself
+    /// on reload.
+    signed_in: Vec<(String, Selection)>,
+}
+
+impl Browser {
+    fn of(state: &SharedState, session_id: Option<&str>) -> Browser {
+        let Some(session_id) = session_id else {
+            return Browser {
+                always_ask: false,
+                signed_in: Vec::new(),
+            };
+        };
+        let sessions = state.stores.sessions.lock().expect("sessions");
+        Browser {
+            always_ask: sessions.always_ask(session_id),
+            signed_in: sessions.selections(session_id),
+        }
+    }
+}
+
+/// **This browser**: one row per `client_id` this browser is signed in for, and
+/// the always-ask flag.
+///
+/// On both versions of the page — with a login in progress and without — because
+/// the question "who does this browser think I am" is the one a developer opens
+/// this page to answer, and a login in progress is not a reason to hide it.
+fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser) -> String {
+    let mut out = String::from("<h2>This browser</h2>\n");
+
+    if browser.signed_in.is_empty() {
+        out.push_str(
+            "<p class=\"lede\">This browser is not signed in to any application. \
+             Start a login and pick somebody, and it will be listed here.</p>\n",
+        );
+    }
+    for (client_id, selection) in &browser.signed_in {
+        out.push_str(&signed_in_row(state, req, client_id, selection));
+    }
+
+    // **Log out of lanyard**: the whole session, every selection and every
+    // refresh token it was issued. Offered even with nothing listed, because a
+    // browser can hold a session record with no selection in it.
+    out.push_str(&format!(
+        "<form class=\"card\" method=\"post\" action=\"/_/logout\">\n{}\
+         <button class=\"submit danger\" type=\"submit\">Log out of lanyard</button>\n\
+         <p class=\"lede\">Every application, not just one. Each application still \
+         holds its own session cookie, and only that application can clear \
+         that.</p>\n</form>\n",
+        back_field(req)
+    ));
+
+    // Its own little form, so the flag can be turned off without starting a
+    // login — and so that turning it on does not need JavaScript to also submit
+    // whichever persona form the human happens to be looking at.
+    let checked = if browser.always_ask { " checked" } else { "" };
+    let back = back_field(req);
+    out.push_str(&format!(
+        "<form class=\"card\" method=\"post\" action=\"/_/session\">\n{back}\
          <div class=\"check\">\
          <input id=\"always-ask\" type=\"checkbox\" name=\"always_ask\" value=\"1\"{checked}>\
          <label for=\"always-ask\">Always ask which person, even when this browser \
          already chose one for an application</label></div>\n\
          <button class=\"submit\" type=\"submit\">Save</button>\n</form>\n"
+    ));
+    out
+}
+
+/// One application this browser is signed in to, and who as.
+///
+/// A `client_id` is developer-supplied like everything else on this page, and
+/// goes through the same escaping. A persona that is no longer in the list is
+/// named by its id rather than dropped — the selection is real even when the
+/// file it came from changed underneath it.
+fn signed_in_row(
+    state: &SharedState,
+    req: Option<&str>,
+    client_id: &str,
+    selection: &Selection,
+) -> String {
+    let who = match state.personas.get(&selection.persona_id) {
+        Some(persona) => match &persona.name {
+            Some(name) => html::escape(name),
+            None => html::escape(&persona.id),
+        },
+        None => format!(
+            "{} <span class=\"none\">(no longer in the persona list)</span>",
+            html::escape(&selection.persona_id)
+        ),
+    };
+    // **Forget** and **Expire now** are the asymmetry the panel exists to make
+    // available: one drops the person and shows the picker next time, the other
+    // kills the tokens and keeps the person, so the app's own renew path runs.
+    format!(
+        "<div class=\"card row\">\n\
+         <span class=\"client\"><code>{client}</code></span>\n\
+         <span class=\"name\">{who}</span>\n\
+         <span class=\"when\">chosen {when}</span>\n\
+         <form method=\"post\" action=\"/_/forget\">{back}\
+         <input type=\"hidden\" name=\"client_id\" value=\"{client}\">\n\
+         <button type=\"submit\" title=\"Drop this application&#39;s persona, so its \
+         next login shows the picker\">Forget</button></form>\n\
+         <form method=\"post\" action=\"/_/expire\">{back}\
+         <input type=\"hidden\" name=\"client_id\" value=\"{client}\">\n\
+         <button type=\"submit\" title=\"Kill this application&#39;s live tokens and \
+         keep the persona, so its own renew path runs\">Expire now</button></form>\n\
+         </div>\n",
+        client = html::escape(client_id),
+        when = html::escape(&ago(selection.auth_time)),
+        back = back_field(req),
     )
+}
+
+/// The hidden field that carries a login in progress across one of these forms,
+/// so a control on this page never abandons the login the human is in the
+/// middle of.
+fn back_field(req: Option<&str>) -> String {
+    match req {
+        Some(req) => format!(
+            "<input type=\"hidden\" name=\"req\" value=\"{}\">\n",
+            html::escape(req)
+        ),
+        None => String::new(),
+    }
+}
+
+/// How long ago, in the words a person would use. `auth_time` is unix seconds
+/// and may predate this process, so a negative difference reads as "just now"
+/// rather than as an enormous number.
+fn ago(unix_seconds: u64) -> String {
+    let elapsed = unix_now().saturating_sub(unix_seconds);
+    match elapsed {
+        0..=44 => "just now".to_string(),
+        45..=5399 => {
+            let minutes = (elapsed + 30) / 60;
+            format!("{minutes} minute{} ago", plural(minutes))
+        }
+        _ => {
+            let hours = (elapsed + 1800) / 3600;
+            format!("{hours} hour{} ago", plural(hours))
+        }
+    }
+}
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 // -------------------------------------------------------------- the pick --
 
 async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
     let form = Form::parse(&body);
+    let browser = Browser::of(&state, session::from_headers(&headers).as_deref());
 
     let Some(req) = form.get("req") else {
-        return expired_page(&state);
+        return expired_page(&state, &browser);
     };
 
     // Consumed: a pending request is answered once. Reloading the picker peeks;
@@ -239,7 +373,7 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
         let mut store = state.stores.pending.lock().expect("pending");
         match store.take(req) {
             Lookup::Found(request) => request,
-            _ => return expired_page(&state),
+            _ => return expired_page(&state, &browser),
         }
     };
 
@@ -302,7 +436,13 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
     };
 
     with_session_cookie(
-        authorize::complete(&state, request, persona, auth_time),
+        authorize::complete(
+            &state,
+            request,
+            persona,
+            auth_time,
+            Some(session_id.clone()),
+        ),
         &session_id,
     )
 }
@@ -341,7 +481,7 @@ fn one_off(form: &Form) -> Result<Persona, String> {
     })
 }
 
-fn expired_page(state: &SharedState) -> Response {
+fn expired_page(state: &SharedState, browser: &Browser) -> Response {
     html::html(
         StatusCode::BAD_REQUEST,
         html::page(
@@ -351,7 +491,7 @@ fn expired_page(state: &SharedState) -> Response {
                  <p>The request was already answered, or its five minutes ran out, or \
                  lanyard was restarted. Start the login again from your \
                  application.</p>\n</div>\n{}",
-                persona_list(state, None, false)
+                persona_list(state, None, browser)
             ),
         ),
     )
@@ -376,13 +516,76 @@ async fn session_settings(
         id
     };
 
-    // Back to the page the human was on, with the login still in progress if
-    // there was one.
-    let back = match form.get("req") {
+    with_session_cookie(authorize::found(&back_to(&form)), &session_id)
+}
+
+/// **Log out of lanyard**: the whole session, and every refresh token it was
+/// issued.
+///
+/// The cookie is expired as well as the record dropped, for `/end_session`'s
+/// reason: the record is what matters, and the cookie is what makes the logout
+/// readable in a network tab.
+async fn logout(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
+    let form = Form::parse(&body);
+    if let Some(session_id) = session::from_headers(&headers) {
+        state
+            .stores
+            .sessions
+            .lock()
+            .expect("sessions")
+            .remove(&session_id);
+        revocation::revoke_session_refresh_tokens(&state, &session_id, None);
+    }
+
+    let mut response = authorize::found(&back_to(&form));
+    if let Ok(value) = header::HeaderValue::from_str(&session::clear_cookie()) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// **Forget**: one `client_id`'s selection, and nothing else. Its next
+/// `/authorize` shows the picker; the other rows are untouched.
+async fn forget(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
+    let form = Form::parse(&body);
+    let session_id = {
+        let mut sessions = state.stores.sessions.lock().expect("sessions");
+        let id = sessions.ensure(session::from_headers(&headers).as_deref());
+        if let Some(client_id) = form.get("client_id") {
+            sessions.forget(&id, client_id);
+        }
+        id
+    };
+    with_session_cookie(authorize::found(&back_to(&form)), &session_id)
+}
+
+/// **Expire now**: revoke one `client_id`'s live tokens and **keep the
+/// selection**.
+///
+/// The asymmetry with Forget is the whole point of the control (CONCEPT §6).
+/// The question it answers is "what does my application do when its token
+/// dies", not "what does the picker look like" — and making the tokens dead
+/// without making the person forgotten is the only way to ask that without
+/// waiting sixty seconds.
+async fn expire(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
+    let form = Form::parse(&body);
+    let session_id = {
+        let mut sessions = state.stores.sessions.lock().expect("sessions");
+        sessions.ensure(session::from_headers(&headers).as_deref())
+    };
+    if let Some(client_id) = form.get("client_id") {
+        revocation::expire_client(&state, &session_id, client_id);
+    }
+    with_session_cookie(authorize::found(&back_to(&form)), &session_id)
+}
+
+/// Back to the page the human was on, with the login still in progress if there
+/// was one. A control on this page never abandons the login it interrupted.
+fn back_to(form: &Form) -> String {
+    match form.get("req") {
         Some(req) => format!("/_/?req={req}"),
         None => "/_/".to_string(),
-    };
-    with_session_cookie(authorize::found(&back), &session_id)
+    }
 }
 
 /// Attaches the one cookie. Set on every response that creates or touches a
@@ -399,4 +602,23 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `auth_time` may predate this process — a remembered selection is
+    /// deliberately older than the page rendering it — and a clock that went
+    /// backwards must read as "just now" rather than as an enormous number.
+    #[test]
+    fn ago_reads_in_the_words_a_person_would_use() {
+        let now = unix_now();
+        assert_eq!(ago(now), "just now");
+        assert_eq!(ago(now + 500), "just now", "a future auth_time saturates");
+        assert_eq!(ago(now - 44), "just now");
+        assert_eq!(ago(now - 60), "1 minute ago");
+        assert_eq!(ago(now - 150), "3 minutes ago");
+        assert_eq!(ago(now - 7200), "2 hours ago");
+    }
 }

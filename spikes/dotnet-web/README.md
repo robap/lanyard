@@ -1,8 +1,8 @@
 # dotnet-web — a browser login, end to end
 
 An ASP.NET Core app with `AddOpenIdConnect` pointed at lanyard and nothing else
-configured. It is Phase 4's primary acceptance client: criteria 1, 6, 26 and 28
-are this app in a browser.
+configured. It is Phase 4's primary acceptance client and Phase 5's: criteria 1,
+6, 26 and 28 of one and 1, 6 and 26 of the other are this app in a browser.
 
 ```
 lanyard serve &          # 127.0.0.1:9500
@@ -16,9 +16,13 @@ than before you have read anything.
 
 | Route | What it does |
 |---|---|
-| `/` | Landing page. *Not signed in* + a **Log in** button, or who you are + **View my claims** and **Log out** |
-| `/secure` | `[Authorize]`. Renders `email:` and the full claim list. Hitting it directly still auto-challenges — that is real .NET behaviour and worth being able to see |
-| `/logout` | Clears **this app's** cookie, not lanyard's. It is not a full log-out — see below |
+| `/` | The whole page. *Not signed in* + a **Log in** button, or who you are, the claim table, and the two log-out buttons |
+| `/secure` | `[Authorize]`, then a redirect back to `/`. It is the **login button's destination** — the 401 is what makes `AddOpenIdConnect` build the redirect to lanyard. Hitting it directly still auto-challenges, which is real .NET behaviour and worth being able to see |
+| `/logout` | **The real log-out.** `SignOutAsync` over the cookie *and* OIDC schemes — see below |
+| `/logout-local` | Clears **this app's** cookie only, and nothing of lanyard's. It is what makes the two-sessions problem visible |
+
+The page itself is [`../shared/page.html`](../shared/page.html), read at runtime
+and shared with `php-web` and `node-spa`. Nothing about it is .NET's.
 
 ## The whole configuration
 
@@ -47,20 +51,36 @@ Two of those lines are the ones people lose an afternoon to:
 is why lanyard implements that mode, and why the login still completes with
 JavaScript switched off — the auto-submitting page carries a `<noscript>` button.
 
-## `/logout` does not log you out
+## Two log-outs, and the difference is the point
 
-It clears ASP.NET Core's own auth cookie, so the next `/secure` goes back to
+```csharp
+// /logout — both sessions
+await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+await ctx.SignOutAsync(OpenIdConnectDefaults.AuthenticationScheme,
+    new AuthenticationProperties { RedirectUri = "/" });
+
+// /logout-local — this app's cookie only
+await ctx.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+```
+
+**There is no lanyard URL anywhere in this file.** The second `SignOutAsync`
+makes `AddOpenIdConnect` read `end_session_endpoint` out of the discovery
+document and build the redirect itself, adding `id_token_hint` because
+`SaveTokens = true` kept one and using its own `SignedOutCallbackPath`
+(`/signout-callback-oidc`) as the `post_logout_redirect_uri`. The chain you see
+in the network tab is:
+
+```
+GET 302  localhost:5000/logout
+GET 302  127.0.0.1:9500/oidc/end_session?post_logout_redirect_uri=…&id_token_hint=…&state=…
+GET 302  localhost:5000/signout-callback-oidc?state=…
+GET 200  localhost:5000/
+```
+
+**`/logout-local` ends one of the two sessions**, so the next login goes back to
 lanyard — which still remembers you and signs you straight back in, with no
-picker. There are two sessions and this ends one of them.
-
-That is not a bug in this spike so much as a missing endpoint. The real thing is
-one click that clears both: `SignOutAsync` over the cookie *and* OIDC schemes,
-which makes `AddOpenIdConnect` redirect the browser to lanyard's
-`end_session_endpoint`, which drops `lanyard_session` and sends you back here.
-`/logout` becomes three lines the day lanyard advertises that endpoint —
-[Phase 5](../../ROADMAP.md#phase-5--session-lifecycle-and-the-remaining-endpoints).
-
-Until then, tick **Always ask** in the picker or restart `lanyard serve`.
+picker. That is not a bug; it is what an SSO session is, and it is the row of the
+table you need in order to see the difference the real log-out makes.
 
 ## The subtraction harness
 
@@ -70,7 +90,7 @@ A setting nobody removed is not evidence of a minimum.
 ```
 DROP=RequireHttpsMetadata dotnet run    # discovery over http:// is refused
 DROP=ResponseType dotnet run            # .NET defaults to id_token; lanyard says so
-DROP=ScopeEmail dotnet run              # /secure renders `email: (no email claim)`
+DROP=ScopeEmail dotnet run              # the claim table has no email row at all
 DROP=ClientSecret dotnet run            # completes anyway: lanyard checks no secret
 ```
 

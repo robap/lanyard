@@ -43,6 +43,20 @@ pub fn set_cookie(session_id: &str) -> String {
     format!("{COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Lax")
 }
 
+/// The `Set-Cookie` that ends the browser's half of the session.
+///
+/// **The record is what matters** — `/oidc/end_session` drops it before writing
+/// this — but expiring the cookie is what makes the logout readable in `curl -i`
+/// and in a network tab, and it is what stops a browser presenting an id that
+/// names nothing on every subsequent request.
+///
+/// Same attributes as [`set_cookie`] plus `Max-Age=0`: a browser matches a
+/// deletion by name, path and domain, so a cookie set with `Path=/` has to be
+/// cleared with `Path=/` or the deletion silently does nothing.
+pub fn clear_cookie() -> String {
+    format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

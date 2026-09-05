@@ -1,20 +1,7 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>node-spa — a public client against lanyard</title>
-<style>
-  body { font: 15px/1.5 system-ui, sans-serif; margin: 3rem auto; max-width: 40rem; padding: 0 1rem; }
-  pre { background: #f4f5f7; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-  button { font: inherit; padding: .5rem 1rem; }
-</style>
-<h1>node-spa</h1>
-<p>
-  A public client — <strong>no <code>client_secret</code> anywhere</strong> — using
-  <code>oidc-client-ts</code> against lanyard. Nothing was registered with lanyard first;
-  the only lanyard-side setup was starting it.
-</p>
-<p><button id="login">Sign in</button> <button id="logout">Sign out</button></p>
-<p id="email"></p>
-<pre id="out">not signed in</pre>
+<div id="page">loading…</div>
 
 <!-- Vendored, not fetched. The bundle is committed next to this file so the
      spike runs with no network and no `npm install`, and so nothing in this
@@ -27,26 +14,70 @@
     redirect_uri: 'http://localhost:5173/',
     post_logout_redirect_uri: 'http://localhost:5173/',
     response_type: 'code',
-    scope: 'openid email profile',
+    // `offline_access` is what asks lanyard for a refresh token, exactly as
+    // `openid` is what asks for an ID token. Without it this SPA gets none and
+    // `automaticSilentRenew` falls back to the iframe path — which is Phase 9's
+    // subject, not this one's.
+    scope: 'openid email profile offline_access',
+    // With a refresh token in hand, a renew is a `POST /oidc/token` with
+    // `grant_type=refresh_token`: no redirect, no `/authorize`, no iframe, and
+    // the address bar never moves.
+    automaticSilentRenew: true,
+    // The default is 60 seconds, and lanyard's access token *lives* 60 seconds
+    // — so the "expiring" event would fire the instant the token arrives, or
+    // never. Ten seconds gives a renew that happens while you watch.
+    accessTokenExpiringNotificationTimeInSeconds: 10,
     // oidc-client-ts sends S256 by default for a public client; named here so
-    // the thing criterion 2 is about is visible in the source.
+    // the thing Phase 4's criterion 2 is about is visible in the source.
     userStore: new oidc.WebStorageStateStore({ store: window.localStorage }),
   }
   const mgr = new oidc.UserManager(settings)
 
-  const out = document.getElementById('out')
-  const emailLine = document.getElementById('email')
+  const escape = (raw) => String(raw ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ))
 
-  function show(user) {
-    if (!user) { out.textContent = 'not signed in'; emailLine.textContent = ''; return }
-    emailLine.innerHTML = 'email: <strong>' + (user.profile.email ?? '(no email claim)') + '</strong>'
-    out.textContent = JSON.stringify(user.profile, null, 2)
+  // **One page, three stacks.** The same `spikes/shared/page.html` that
+  // `dotnet-web` and `php-web` read on the server, fetched and filled here —
+  // through a symlink, so it really is the one file and not a copy that can
+  // drift. Nothing is built and nothing is generated.
+  const template = fetch('./shared/page.html').then((r) => r.text())
+
+  async function show(user) {
+    const claims = user ? user.profile : {}
+    const rows = Object.entries(claims)
+      .map(([k, v]) => `<tr><td class="k">${escape(k)}</td>` +
+        `<td class="v">${escape(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`)
+      .join('')
+
+    const html = (await template)
+      .replace('{{APP}}', 'node-spa')
+      .replace('{{WHO}}', escape(user ? (user.profile.email ?? user.profile.sub) : ''))
+      .replace('{{SIGNED_IN}}', user ? '' : 'hidden')
+      .replace('{{SIGNED_OUT}}', user ? 'hidden' : '')
+      .replace('{{CLAIM_ROWS}}', rows)
+
+    // Only the <main> of the shared page; the surrounding shell is this
+    // document's own, because a SPA replaces a fragment rather than reloading.
+    // The <style> comes across with it, so the three pages look identical.
+    const parsed = new DOMParser().parseFromString(html, 'text/html')
+    document.getElementById('page').replaceChildren(
+      parsed.querySelector('style'),
+      parsed.querySelector('main')
+    )
+
+    // The shared page's three links are hrefs the two server-rendered stacks
+    // follow. This one has no cookie to clear and no protected route to be
+    // challenged from, so it maps them onto the three calls that mean the same
+    // things — and that is the only stack-shaped difference on the page.
+    intercept('login', () => mgr.signinRedirect())
+    intercept('logout', () => mgr.signoutRedirect())
+    intercept('logout-local', async () => { await mgr.removeUser(); show(null) })
   }
 
-  document.getElementById('login').onclick = () => mgr.signinRedirect()
-  document.getElementById('logout').onclick = async () => {
-    await mgr.removeUser()
-    show(null)
+  function intercept(id, action) {
+    const el = document.getElementById(id)
+    if (el) el.onclick = (e) => { e.preventDefault(); action() }
   }
 
   ;(async () => {
@@ -57,10 +88,17 @@
         show(user)
         return
       } catch (err) {
-        out.textContent = 'FAILED: ' + err
+        document.getElementById('page').textContent = 'FAILED: ' + err
         return
       }
     }
     show(await mgr.getUser())
   })()
+
+  // A renew that happened is worth being able to see without a network tab.
+  mgr.events.addUserLoaded((user) => {
+    console.log('[node-spa] access token renewed, expires in', user.expires_in, 'seconds')
+    show(user)
+  })
+  mgr.events.addSilentRenewError((err) => console.error('[node-spa] renew failed', err))
 </script>

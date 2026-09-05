@@ -18,20 +18,33 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::{Host, Url};
 
 /// The rule, in the words the rendered `400` uses.
-pub const RULE: &str = "lanyard only accepts a redirect_uri on loopback: \
-scheme http or https, and a host of localhost, any *.localhost name, \
-any 127.0.0.0/8 address, or [::1]. The host is compared literally — \
-no DNS lookup happens — so a name like web.localtest.me is rejected \
-even though it resolves to 127.0.0.1.";
+///
+/// It is told which parameter it is guarding because Phase 5 pointed the same
+/// check at a second one, `post_logout_redirect_uri`, and a rule that names the
+/// wrong parameter is a rule the developer reading it has to translate.
+pub fn rule(parameter: &str) -> String {
+    format!(
+        "lanyard only accepts a {parameter} on loopback: \
+         scheme http or https, and a host of localhost, any *.localhost name, \
+         any 127.0.0.0/8 address, or [::1]. The host is compared literally — \
+         no DNS lookup happens — so a name like web.localtest.me is rejected \
+         even though it resolves to 127.0.0.1."
+    )
+}
 
 /// Parse `raw` and accept it only if its host is loopback. Any port, any path,
 /// any query.
-pub fn check(raw: &str) -> Result<Url, String> {
-    let url = Url::parse(raw).map_err(|e| format!("redirect_uri {raw:?} is not a URL: {e}"))?;
+///
+/// **One function, two parameters.** `/oidc/authorize` guards `redirect_uri`
+/// and `/oidc/end_session` guards `post_logout_redirect_uri` with this exact
+/// call: extending the boundary to a second parameter must not mean a second
+/// implementation of it (north star 1).
+pub fn check(parameter: &str, raw: &str) -> Result<Url, String> {
+    let url = Url::parse(raw).map_err(|e| format!("{parameter} {raw:?} is not a URL: {e}"))?;
 
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!(
-            "redirect_uri {raw:?} has scheme {:?}, which is not http or https",
+            "{parameter} {raw:?} has scheme {:?}, which is not http or https",
             url.scheme()
         ));
     }
@@ -41,9 +54,9 @@ pub fn check(raw: &str) -> Result<Url, String> {
         Some(Host::Ipv4(addr)) if is_loopback_v4(addr) => Ok(url),
         Some(Host::Ipv6(addr)) if addr == Ipv6Addr::LOCALHOST => Ok(url),
         Some(host) => Err(format!(
-            "redirect_uri {raw:?} has host {host}, which is not loopback"
+            "{parameter} {raw:?} has host {host}, which is not loopback"
         )),
-        None => Err(format!("redirect_uri {raw:?} has no host")),
+        None => Err(format!("{parameter} {raw:?} has no host")),
     }
 }
 
@@ -65,11 +78,22 @@ mod tests {
     use super::*;
 
     fn accepted(raw: &str) -> Url {
-        check(raw).unwrap_or_else(|e| panic!("{raw} should be accepted: {e}"))
+        check("redirect_uri", raw).unwrap_or_else(|e| panic!("{raw} should be accepted: {e}"))
     }
 
     fn rejected(raw: &str) -> String {
-        check(raw).expect_err(&format!("{raw} should be rejected"))
+        check("redirect_uri", raw).expect_err(&format!("{raw} should be rejected"))
+    }
+
+    /// The same check, told it is guarding the logout parameter: same verdict,
+    /// and a message that names what the developer actually sent.
+    #[test]
+    fn the_same_check_names_whichever_parameter_it_is_guarding() {
+        assert!(check("post_logout_redirect_uri", "http://localhost:5000/").is_ok());
+        let message = check("post_logout_redirect_uri", "https://evil.example.com/").unwrap_err();
+        assert!(message.contains("post_logout_redirect_uri"), "{message}");
+        assert!(message.contains("not loopback"), "{message}");
+        assert!(rule("post_logout_redirect_uri").contains("post_logout_redirect_uri"));
     }
 
     #[test]

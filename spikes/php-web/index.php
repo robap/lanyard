@@ -1,8 +1,9 @@
 <?php
 // Phase 0 asked: does jumbojett/openid-connect-php complete a real login against
 // an http:// issuer with nothing but defaults? Phase 4 repointed it at lanyard,
-// where `requestUserInfo()` is what proves /oidc/userinfo answers a real client
-// rather than a curl. Deliberately minimal — every line that is here had to be.
+// where `requestUserInfo()` is what proves /oidc/userinfo answers a real client.
+// Phase 5 added the log-out, which is `$oidc->signOut(...)` and nothing else.
+// Deliberately minimal — every line that is here had to be.
 //
 //   composer install
 //   php -S localhost:5001 index.php
@@ -28,57 +29,58 @@ if (!in_array('HttpUpgradeInsecureRequests', $drop, true)) {
     $oidc->setHttpUpgradeInsecureRequests(false);
 }
 
-/**
- * A deliberately plain page shell, kept close to `dotnet-web`'s so the two apps
- * look like the same app. Unifying them properly — one template, every stack —
- * is roadmap Phase 11.
- */
-function page(string $title, string $body): string
-{
-    return <<<HTML
-    <!doctype html>
-    <html lang="en">
-    <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{$title}</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
-             max-width: 36rem; margin: 4rem auto; padding: 0 1rem; }
-      h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
-      .state { font-size: 1.05rem; }
-      .button { display: inline-block; padding: .55rem 1rem; margin: .25rem .4rem .25rem 0;
-                border-radius: 7px; background: #2f5bd7; color: #fff;
-                text-decoration: none; font-weight: 600; }
-      .button.secondary { background: transparent; color: inherit;
-                          border: 1px solid currentColor; font-weight: 400; }
-      .note { color: #666; font-size: .875rem; margin-top: 2rem; }
-      pre { background: rgba(127,127,127,.12); padding: 1rem; border-radius: 8px;
-            overflow-x: auto; }
-      code { font-family: ui-monospace, monospace; font-size: .875em; }
-    </style>
-    </head>
-    <body>
-    <h1>{$title}</h1>
-    {$body}
-    </body>
-    </html>
-    HTML;
-}
-
 function e(?string $raw): string
 {
     return htmlspecialchars($raw ?? '', ENT_QUOTES, 'UTF-8');
 }
 
-$action     = $_GET['action'] ?? null;
+/**
+ * **One page, three stacks.** `spikes/shared/page.html` is read at runtime, not
+ * copied and not generated, so this application and `dotnet-web` cannot render
+ * differently by accident — and every visible difference between them is a
+ * difference in the stack, which is the question these spikes exist to answer.
+ */
+function page(string $app, bool $signedIn, string $who, array $claims): string
+{
+    $rows = '';
+    foreach ($claims as $name => $value) {
+        $rows .= '<tr><td class="k">' . e($name) . '</td>'
+            . '<td class="v">' . e(is_scalar($value) ? (string) $value : json_encode($value))
+            . '</td></tr>';
+    }
+
+    return strtr(
+        file_get_contents(__DIR__ . '/../shared/page.html'),
+        [
+            '{{APP}}'        => e($app),
+            '{{WHO}}'        => e($who),
+            '{{SIGNED_IN}}'  => $signedIn ? '' : 'hidden',
+            '{{SIGNED_OUT}}' => $signedIn ? 'hidden' : '',
+            '{{CLAIM_ROWS}}' => $rows,
+        ]
+    );
+}
+
+$path       = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $isCallback = isset($_GET['code']) || isset($_GET['error']);
 
-if ($action === 'logout') {
-    // This app's session only. lanyard still remembers the persona, so signing
-    // in again will not show the picker — full logout needs /oidc/end_session,
-    // which is roadmap Phase 5.
+// **The real log-out, and it is one line of ours.** `signOut()` reads
+// `end_session_endpoint` out of lanyard's discovery document, sends the ID token
+// as `id_token_hint`, redirects, and exits — so this application's session has
+// to go first. The second argument is the `post_logout_redirect_uri`, which is
+// this app's own root: loopback, and therefore accepted.
+if ($path === '/logout') {
+    $idToken  = $_SESSION['id_token'] ?? null;
+    $_SESSION = [];
+    session_destroy();
+    $oidc->signOut($idToken, getenv('BASE_URL') ?: 'http://localhost:5001/');
+    exit;
+}
+
+// This app's session only. lanyard still remembers the persona, so signing in
+// again signs you straight back in as the same person — which is the difference
+// the two buttons exist to show.
+if ($path === '/logout-local') {
     $_SESSION = [];
     session_destroy();
     header('Location: /');
@@ -89,9 +91,13 @@ if ($action === 'logout') {
 // the flow and the callback handler, so calling it on every page load — which is
 // what this spike used to do — means the front door is an instant redirect and
 // the whole flow is invisible. Now the front door is a page with a button.
-if ($action === 'login' || $isCallback) {
+if ($path === '/secure' || $isCallback) {
     try {
         $oidc->authenticate();
+        // Kept so the log-out above has an `id_token_hint` to send. lanyard
+        // never requires one, but a real IdP might, and a spike that skipped it
+        // would be testing a shape production does not have.
+        $_SESSION['id_token'] = $oidc->getIdToken();
         // Three calls to GET /oidc/userinfo with a bearer token, server to
         // server. This is the thing this spike is evidence of.
         $_SESSION['user'] = [
@@ -105,13 +111,9 @@ if ($action === 'login' || $isCallback) {
         exit;
     } catch (Throwable $e) {
         http_response_code(500);
-        echo page('php-web', sprintf(
-            '<p class="state">Login failed.</p><pre>%s%s%s</pre>'
-                . '<p><a class="button" href="/">Start over</a></p>',
-            e(get_class($e)),
-            "\n\n",
-            e($e->getMessage())
-        ));
+        echo page('php-web', false, '', [
+            get_class($e) => $e->getMessage(),
+        ]);
         exit;
     }
 }
@@ -119,26 +121,8 @@ if ($action === 'login' || $isCallback) {
 $user = $_SESSION['user'] ?? null;
 
 if ($user) {
-    $claims = sprintf(
-        "email: %s\n\nname:  %s\nsub:   %s",
-        e($user['email']),
-        e($user['name']),
-        e($user['sub'])
-    );
-    echo page('php-web', sprintf(
-        '<p class="state">Signed in as <strong>%s</strong>.</p>'
-            . '<pre>%s</pre>'
-            . '<p><a class="button secondary" href="/?action=logout">Log out</a></p>'
-            . '<p class="note">Those three lines came from three '
-            . '<code>requestUserInfo()</code> calls — <code>GET /oidc/userinfo</code> '
-            . 'with a bearer token, server to server.</p>',
-        e($user['email'] ?: $user['sub']),
-        $claims
-    ));
+    echo page('php-web', true, $user['email'] ?: $user['sub'], $user);
     exit;
 }
 
-echo page('php-web', '<p class="state">Not signed in.</p>'
-    . '<p><a class="button" href="/?action=login">Log in with lanyard</a></p>'
-    . '<p class="note">That link calls <code>$oidc-&gt;authenticate()</code>, which '
-    . 'redirects to lanyard, shows you a list of people, and comes back here.</p>');
+echo page('php-web', false, '', []);

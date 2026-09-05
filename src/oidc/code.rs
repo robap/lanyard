@@ -80,6 +80,11 @@ pub struct CodeRecord {
     /// when the selection was remembered from an earlier login.
     pub auth_time: u64,
     pub request: AuthRequest,
+    /// The browser session this login belongs to, carried so that a refresh
+    /// token minted from this code knows which **Log out** revokes it. Absent
+    /// for a login that never had a session — which a curl-only code flow does
+    /// not, and which is not an error.
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]

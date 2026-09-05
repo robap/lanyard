@@ -17,21 +17,17 @@ is being logged in as somebody *other* than whoever the .NET app is.
 
 | URL | What it does |
 |---|---|
-| `/` | Landing page, or the claims if you are signed in |
-| `/?action=login` | Calls `authenticate()`, which starts the redirect |
+| `/` | The whole page: a **Log in** button, or who you are, the claim table, and the two log-out buttons |
+| `/secure` | Calls `authenticate()`, which starts the redirect. Same URL the .NET app uses for the same thing, because the page is shared |
 | `/?code=…` | The callback. Redeems the code, reads UserInfo, then redirects to `/` so the address bar is clean and a reload cannot replay a spent code |
-| `/?action=logout` | Drops **this app's** session. lanyard still remembers you — full logout is roadmap Phase 5 |
+| `/logout` | **The real log-out**: `$oidc->signOut($idToken, 'http://localhost:5001/')`, which reads `end_session_endpoint` out of the discovery document, sends the ID token as `id_token_hint`, redirects, and exits. No lanyard URL appears in `index.php` |
+| `/logout-local` | Drops **this app's** session only. lanyard still remembers you, so signing in again signs you straight back in — which is the difference the two buttons exist to show |
 
-Signed in, the page shows:
+The page itself is [`../shared/page.html`](../shared/page.html), read at runtime
+and shared with `dotnet-web` and `node-spa`. Nothing about it is PHP's.
 
-```
-email: mira@example.test
-
-name:  Mira Okonkwo
-sub:   mira
-```
-
-Those three lines come from three `requestUserInfo()` calls, which is
+Signed in, the claim table shows three rows — `email`, `name`, `sub`. They come
+from three `requestUserInfo()` calls, which is
 `GET /oidc/userinfo` with a bearer token, server to server. If lanyard's UserInfo
 response were wrong or its access token unverifiable, this page would say
 `FAILED:` and the exception.
@@ -47,7 +43,15 @@ $oidc = new OpenIDConnectClient(
 $oidc->setRedirectURL('http://localhost:5001/');
 $oidc->addScope(['openid', 'email', 'profile']);
 $oidc->setHttpUpgradeInsecureRequests(false);
+
+// and, on /logout:
+$oidc->signOut($_SESSION['id_token'], 'http://localhost:5001/');
 ```
+
+`signOut()` **requires `end_session_endpoint` in the discovery document** or it
+throws, and it needs the ID token kept in the session — which is the one line
+Phase 5 added to the login path. The second argument is the
+`post_logout_redirect_uri`: loopback, and therefore accepted.
 
 **PHP needs one setting that .NET does not**, and one that .NET needs that PHP
 does not. `setHttpUpgradeInsecureRequests(false)` stops jumbojett rewriting the

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{APP}} — a lanyard spike</title>
+<!--
+  One page, three stacks.
+
+  `dotnet-web` and `php-web` read this file at runtime (`File.ReadAllText`,
+  `file_get_contents`) and `node-spa` fetches it and fills it in the browser.
+  Nothing is copied, generated, or built — there is exactly one of this file, and
+  a stack that drifts from it cannot drift silently.
+
+  **That is the whole reason it exists.** When the page is a constant, every
+  visible difference between .NET and PHP is a difference in the stack, which is
+  the question these applications exist to answer. Before this file, comparing
+  what two stacks actually did meant reading past two different presentations of
+  it.
+
+  The substitution points, and nothing else is one. Each is written in the
+  markup below wrapped in doubled braces; they are named bare here because a
+  stack substitutes every occurrence, this comment included, and a comment that
+  documents a token by rewriting itself is a comment that lies.
+
+    APP         the application's name, e.g. dotnet-web
+    WHO         who you are signed in as; empty when you are not
+    SIGNED_IN   "hidden" when signed out, "" when signed in
+    SIGNED_OUT  the opposite
+    CLAIM_ROWS  <tr><td class="k">name</td><td class="v">value</td></tr>, one
+                per claim, in the order the stack produced them. **The orders
+                will differ, and that difference is a finding rather than a
+                defect in this page.**
+
+  Every value substituted in has been escaped by the stack doing the
+  substituting. A claim comes out of a token and a token comes out of a persona
+  file, and a spike that executes its own claim list would be a bad look for a
+  tool whose pitch is "it catches your bugs".
+
+  The two links in the signed-in state are followed by the server-rendered
+  stacks and intercepted by `node-spa`, which has no cookie to clear and no
+  protected route to be challenged from: it maps them onto
+  `mgr.signoutRedirect()` and `mgr.removeUser()`, which are the same two ideas.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif;
+         max-width: 40rem; margin: 4rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 1.5rem; }
+  .state { font-size: 1.05rem; }
+  .button { display: inline-block; padding: .55rem 1rem; margin: .25rem .4rem .25rem 0;
+            border-radius: 7px; background: #2f5bd7; color: #fff;
+            text-decoration: none; font-weight: 600; }
+  .button.secondary { background: transparent; color: inherit;
+                      border: 1px solid currentColor; font-weight: 400; }
+  .note { color: #767b85; font-size: .875rem; margin-top: 2rem; }
+  code { font-family: ui-monospace, monospace; font-size: .875em; }
+  table.claims { border-collapse: collapse; width: 100%; margin-top: 1.5rem; }
+  table.claims th { text-align: left; font-size: .8rem; text-transform: uppercase;
+                    letter-spacing: .06em; color: #767b85; font-weight: 600;
+                    padding: 0 .75rem .4rem 0; }
+  table.claims td { padding: .35rem .75rem .35rem 0; vertical-align: top;
+                    border-top: 1px solid rgba(127,127,127,.25); }
+  table.claims .k { font-family: ui-monospace, monospace; font-size: .875em;
+                    white-space: nowrap; }
+  table.claims .v { word-break: break-word; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+<h1>{{APP}}</h1>
+
+<div class="{{SIGNED_OUT}}">
+  <p class="state">Not signed in.</p>
+  <p><a class="button" id="login" href="/secure">Log in with lanyard</a></p>
+  <p class="note">
+    That link goes to a page this application protects. It has no idea who you
+    are, so it sends you to lanyard, lanyard shows you a list of people, and you
+    come back here signed in. No password, no consent screen, and nothing was
+    registered with lanyard first.
+  </p>
+</div>
+
+<div class="{{SIGNED_IN}}">
+  <p class="state">Signed in as <strong>{{WHO}}</strong>.</p>
+  <p>
+    <a class="button" id="logout" href="/logout">Log out</a>
+    <a class="button secondary" id="logout-local" href="/logout-local">Clear this app&#39;s cookie only</a>
+  </p>
+  <table class="claims">
+    <thead><tr><th>claim</th><th>value</th></tr></thead>
+    <tbody>{{CLAIM_ROWS}}</tbody>
+  </table>
+  <p class="note">
+    <strong>Log out</strong> ends <em>both</em> sessions: this application drops
+    its own cookie and sends your browser through
+    <code>/oidc/end_session</code>, so lanyard forgets you too and the next login
+    shows the picker. <strong>Clear this app&#39;s cookie only</strong> ends just
+    this one — lanyard still remembers you, so signing in again signs you
+    straight back in as the same person. That difference is the whole reason
+    both buttons are here.
+  </p>
+</div>
+</main>
+</body>
+</html>

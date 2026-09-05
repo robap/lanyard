@@ -1,0 +1,5 @@
+Criterion 25 — the SPA console across a full sign-in, an automaticSilentRenew,
+and a sign-out. No CORS error, no Access-Control complaint.
+
+log: [node-spa] access token renewed, expires in 60 seconds
+log: [node-spa] access token renewed, expires in 60 seconds

@@ -8,6 +8,14 @@
 //! [`ClaimFilter::Unfiltered`] exists and why every Phase 2 and Phase 3 caller
 //! passes it and is byte-identical to before.
 
+/// The scope that asks for a refresh token, named once so the gate and the
+/// discovery document cannot spell it differently.
+///
+/// It is **not** a claim filter and adds nothing to any token: it appears in
+/// `scopes_supported` and in the granted `scope` echoed back, and its only
+/// effect is whether `POST /oidc/token` returns a `refresh_token`.
+pub const OFFLINE_ACCESS: &str = "offline_access";
+
 /// The scopes an authorization request asked for, split on whitespace as RFC
 /// 6749 §3.3 defines them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,6 +44,28 @@ impl Scopes {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether every scope in `other` was granted here. RFC 6749 §6: a refresh
+    /// may **narrow** the grant and may not widen it.
+    ///
+    /// Returns the first scope that was not granted rather than a bare `false`,
+    /// because the refusal has to name it — a developer reading `invalid_scope`
+    /// needs to know which of the values they sent was the problem.
+    pub fn missing_from<'a>(&self, other: &'a Scopes) -> Option<&'a str> {
+        other
+            .0
+            .iter()
+            .find(|scope| !self.has(scope))
+            .map(String::as_str)
+    }
+
+    /// The space-separated form, which is what a token response's `scope` and a
+    /// token's `scope` claim carry. Rebuilt from the parsed set rather than
+    /// echoing the request's string, because a narrowed grant is not the string
+    /// anybody sent.
+    pub fn to_raw(&self) -> String {
+        self.0.join(" ")
     }
 }
 
@@ -121,6 +151,35 @@ mod tests {
         assert!(bare.allows("sub"));
         assert!(bare.allows("roles"));
         assert!(bare.allows("department"), "a persona's own attribute");
+    }
+
+    /// RFC 6749 §6, as a unit test: narrowing is silent, widening names the
+    /// offending value.
+    #[test]
+    fn missing_from_finds_the_scope_that_was_never_granted() {
+        let granted = Scopes::parse(Some("openid email offline_access"));
+        assert_eq!(granted.missing_from(&Scopes::parse(Some("openid"))), None);
+        assert_eq!(granted.missing_from(&Scopes::parse(None)), None);
+        assert_eq!(
+            granted.missing_from(&Scopes::parse(Some("openid email offline_access"))),
+            None,
+            "asking for exactly what was granted is not widening"
+        );
+        assert_eq!(
+            granted.missing_from(&Scopes::parse(Some("openid admin"))),
+            Some("admin")
+        );
+    }
+
+    /// The space-separated form, rebuilt rather than echoed: a narrowed grant
+    /// is not the string anybody sent.
+    #[test]
+    fn to_raw_is_the_space_separated_form_of_what_is_held() {
+        assert_eq!(
+            Scopes::parse(Some("openid  email\tprofile")).to_raw(),
+            "openid email profile"
+        );
+        assert_eq!(Scopes::parse(None).to_raw(), "");
     }
 
     /// A request with no `openid` still filters — it just gets no ID token to

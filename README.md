@@ -98,13 +98,17 @@ LANYARD_ISSUER=http://lanyard:9500/oidc lanyard serve
 ```
 
 **The discovery document lists only the endpoints that exist.** Today that is
-`jwks_uri`, `token_endpoint`, `authorization_endpoint` and `userinfo_endpoint`;
-there is no `end_session_endpoint` yet, because advertising an endpoint that
-returns 404 sends a client down a path that cannot work. The document grows each
-phase, and it is corrected when it turns out to have promised something:
-`response_types_supported` is now exactly `["code"]`, because advertising
-`id_token` would tell a .NET app that its *default* setting is supported and
-then refuse it at request time.
+`jwks_uri`, `token_endpoint`, `authorization_endpoint`, `userinfo_endpoint`,
+`end_session_endpoint`, `introspection_endpoint` and `revocation_endpoint`,
+because advertising an endpoint that returns 404 sends a client down a path that
+cannot work. **The rule cuts both ways**, and Phase 5 is where that mattered:
+ASP.NET Core's `SignOutAsync` reads `end_session_endpoint` out of the document
+and silently builds no redirect when it is missing, so an endpoint that exists
+and is not advertised fails exactly as confusingly as one advertised and
+missing. The document is also corrected when it turns out to have promised
+something: `response_types_supported` is now exactly `["code"]`, because
+advertising `id_token` would tell a .NET app that its *default* setting is
+supported and then refuse it at request time.
 
 **Any `aud` mints.** `--aud not-a-real-api` is a token, not an error. Audiences
 follow the same no-registration rule as everything else, and an audience your API
@@ -124,13 +128,16 @@ options.TokenValidationParameters.ClockSkew = TimeSpan.Zero;
 
 Measured both ways in [`docs/decisions/dotnet-jwt-bearer-settings.md`](docs/decisions/dotnet-jwt-bearer-settings.md).
 
-**Scope.** This is Phase 4. There is a discovery document, a JWKS, both halves
-of `/oidc/token`, `/oidc/authorize`, `/oidc/userinfo`, the persona picker at
-`/_/`, browser sessions, the `token` and `env` CLI commands, the six deliberate
-failure flags, and the test seam. There is no `refresh_token` (even when
-`offline_access` is requested), no `/end_session`, no `/introspect`, no
-`/revoke`, no request log, and no consent screen — a consent screen is client
-registration in a different costume.
+**Scope.** This is Phase 5. There is a discovery document, a JWKS, all three
+arms of `/oidc/token` — `client_credentials`, `authorization_code` and
+`refresh_token` — plus `/oidc/authorize`, `/oidc/userinfo`,
+`/oidc/end_session`, `/oidc/introspect`, `/oidc/revoke`, the persona picker at
+`/_/` with its three session controls, browser sessions, the `token` and `env`
+CLI commands, the six deliberate failure flags, and the test seam. There is no
+request log yet, no back-channel or front-channel logout, no `sid` in the ID
+token, no `check_session_iframe`, nothing persisted across a restart, and no
+consent screen — a consent screen is client registration in a different
+costume.
 
 ## Configuration
 
@@ -398,6 +405,10 @@ so your app's own error handling runs.
 - **Always ask** — a checkbox that forces the picker for every `client_id` in
   this browser. It is on the picker and on the no-login version of the page, so
   it can be turned off without starting a login.
+- **This browser** — one row per `client_id` this browser is signed in for,
+  naming the person and when they were chosen, each with **Forget** and
+  **Expire now**, plus **Log out of lanyard** below them. See
+  [Logging out](#three-controls-on-_).
 - Visiting `/_/` with no login in progress lists the same people and says so.
   That is the URL the banner prints.
 
@@ -430,11 +441,13 @@ chosen and the moment it was chosen. That per-`client_id` scoping is the whole
 multi-project property: log in to one app as Ada and another as Mira in the same
 browser, and neither disturbs the other.
 
-Two resets, both worth knowing:
+Three resets, all worth knowing:
 
+- **[Log out](#logging-out).** One click in your application, both sessions gone.
 - **Close the browser.** The cookie has no expiry, so it goes.
-- **Restart `lanyard serve`.** Sessions, pending authorization requests and
-  authorization codes all live in memory and all die with the process.
+- **Restart `lanyard serve`.** Sessions, pending authorization requests,
+  authorization codes, refresh tokens and revocations all live in memory and all
+  die with the process.
 
 The picker appears anyway when "always ask" is set, when `prompt=login` or
 `prompt=select_account` is sent, or when `max_age` is sent and the remembered
@@ -445,6 +458,100 @@ works: lanyard's `Lax` cookie is not sent on a third-party iframe navigation, so
 a real SPA renew will get `login_required`. It is a promise that lanyard never
 puts a login screen somewhere nobody can click it.
 
+## Logging out
+
+**There are two sessions**, and knowing which one you just ended is most of
+this section.
+
+| Cookie you delete by hand | What happens on the next protected page |
+|---|---|
+| `lanyard_session` only | **Nothing observable.** Still the same person, and the browser never reaches lanyard at all |
+| Your application's cookie only | A round trip to lanyard, which still remembers you — so **no picker**, and you are signed straight back in as the same person |
+| Both | The picker, at last |
+
+**Why deleting `lanyard_session` by hand does nothing visible.** Your
+application holds its own session cookie. While it has one it never asks lanyard
+anything, so nothing lanyard forgot can matter. That is not a lanyard bug — it
+is what an SSO session *is*, and an application whose log-out does not go
+through the provider behaves exactly the same way against Okta. Deleting cookies
+by hand is the wrong tool; the right one is the button.
+
+### One click, both sessions
+
+`GET` or `POST /oidc/end_session` — OIDC RP-Initiated Logout, and it is a
+browser redirect chain rather than a back-channel call, because
+`lanyard_session` lives in the browser and only a top-level navigation carries
+it:
+
+```
+GET 302  localhost:5000/logout                your app drops its own cookie
+GET 302  127.0.0.1:9500/oidc/end_session      lanyard drops the whole session
+GET 302  localhost:5000/signout-callback-oidc back at your app, signed out
+```
+
+Every SDK ships this as a one-liner and builds the URL from the discovery
+document — no lanyard URL appears in any of the spikes:
+
+| Stack | The call |
+|---|---|
+| ASP.NET Core | `SignOutAsync` over the cookie **and** OpenID Connect schemes |
+| `jumbojett/openid-connect-php` | `$oidc->signOut($idToken, $postLogoutRedirect)` |
+| `oidc-client-ts` | `mgr.signoutRedirect()` |
+
+| Parameter | Handling |
+|---|---|
+| `post_logout_redirect_uri` | Optional. **Loopback or a rendered `400`** — [the one rejection](#the-one-rejection), applied to a second parameter |
+| `state` | Echoed byte-for-byte when sent, absent when not. Never invented |
+| `id_token_hint` | Optional, **never required**. Read for its `aud` so the rendered page can name your application; expired, foreign, malformed and absent all log out identically |
+| `client_id` | Ignored except for display |
+| `logout_hint`, `ui_locales` | Ignored |
+
+**Logging out never fails.** No session, an unknown session, a session from
+before a restart — all of them are the same redirect. There is **no confirmation
+screen**, ever: RP-Initiated Logout §2 says the OP *should* ask when there is no
+valid `id_token_hint`, and lanyard does not, for the same reason it has no
+consent screen. A prompt nobody can automate past is a prompt in the way of a
+test.
+
+With no `post_logout_redirect_uri`, lanyard renders its own page saying you are
+signed out and linking to `/_/`, rather than leaving you on a blank one. The
+response carries `Set-Cookie: lanyard_session=; …; Max-Age=0` either way, so the
+log-out is readable in `curl -i` and in a network tab.
+
+### It clears the whole browser session, not one `client_id`
+
+lanyard's session holds a selection per `client_id`, so `/end_session` from one
+application *could* drop just that one. **It drops everything** — every
+selection, and every refresh token that session was issued. Every real IdP has
+one SSO session and clears all of it, and diverging from production is the thing
+this project exists not to do. A "full log-out" that leaves a working refresh
+token in an application's local storage is not one.
+
+The cost is real and is on the record: **logging out of one application logs you
+out of the other two.** If what you wanted was one, that control is **Forget**
+on `/_/` — where you reach for it deliberately, rather than on a protocol
+endpoint where an SDK would reach it by accident.
+
+### Three controls on `/_/`
+
+The picker's **This browser** section lists one row per `client_id` this browser
+is signed in for, naming the person and when they were chosen.
+
+| Control | What it does | What you observe afterwards |
+|---|---|---|
+| **Log out of lanyard** | The whole session: every selection, every refresh token | The next login from any application shows the picker |
+| **Forget** | One `client_id`'s selection | That application's next login shows the picker; the others are untouched |
+| **Expire now** | Revokes one `client_id`'s live access and refresh tokens and **keeps the selection** | Your application's next API call gets `401` and its refresh fails — so **its own renew path runs**, rather than the picker appearing |
+
+**Expire now** is the control that answers "what does my application do when its
+token dies", and keeping the person is the whole point of it: making the tokens
+dead without making the person forgotten is the only way to ask that question
+without waiting.
+
+All three are plain `POST` forms. No JavaScript, and no CSRF token — the cookie
+is `SameSite=Lax`, so a cross-site POST arrives without it and therefore acts on
+no session.
+
 ## Scope, and what it filters
 
 | Scope requested | Claims added |
@@ -453,10 +560,13 @@ puts a login screen somewhere nobody can click it.
 | `email` | `email`, `email_verified` |
 | `profile` | `name`, `preferred_username` |
 | always | `roles`, and the persona's arbitrary `attributes` |
+| `offline_access` | **none** — it adds no claim; it asks for a [refresh token](#refresh-tokens) |
 
 `roles` and `attributes` are unscoped because OIDC defines no scope for them, and
 hiding your own custom claims behind a standard scope would be lanyard inventing
-a rule.
+a rule. `offline_access` is not a filter at all: it appears in `scopes_supported`
+and in the granted `scope` echoed back, and its only effect is whether the token
+response carries a `refresh_token`.
 
 **This filter applies to the ID token and to `/userinfo`. It does not apply to
 the access token, and that asymmetry is deliberate.** OIDC Core §5.4 specifies
@@ -536,7 +646,7 @@ curl -X POST http://127.0.0.1:9500/oidc/token \
 
 | Parameter | Required | Meaning |
 |---|---|---|
-| `grant_type` | yes | `client_credentials` or `authorization_code`. Anything else is `400 unsupported_grant_type` |
+| `grant_type` | yes | `client_credentials`, `authorization_code` or `refresh_token`. Anything else is `400 unsupported_grant_type` |
 | `persona` | no | A loaded persona id. Unknown ids are a `400` naming the id |
 | `audience` | no | The `aud` claim. `resource` (RFC 8707) is a synonym; `audience` wins |
 | `scope` | no | Space-delimited. Becomes the `scope` claim and is echoed in the response |
@@ -550,10 +660,116 @@ what lets three services on three ports share one running instance with no setup
 between them.
 
 The parameters above are the `client_credentials` grant's; `authorization_code`
-takes [its own set](#the-authorization-endpoint). A `client_credentials` response
-carries no `id_token` — client credentials has no user authentication event to
-attest to — and neither grant issues a `refresh_token`. Unknown parameters are
-ignored. Errors are `400` with `{"error", "error_description"}`.
+takes [its own set](#the-authorization-endpoint) and `refresh_token` is below. A
+`client_credentials` response carries no `id_token` — client credentials has no
+user authentication event to attest to — and **never a `refresh_token`**: RFC
+6749 §4.4.3 forbids it, and the reason is good, because there is no user, so
+there is nothing a refresh could be on behalf of. Unknown parameters are ignored.
+Errors are `400` with `{"error", "error_description"}`.
+
+## Refresh tokens
+
+**`offline_access` gates the refresh token exactly as `openid` gates the ID
+token.** Ask for it in the authorization request and the token response carries
+one; leave it out and there is no `refresh_token` key at all.
+
+```
+GET /oidc/authorize?client_id=billing-web&response_type=code
+    &redirect_uri=http://localhost:5000/cb&scope=openid%20email%20offline_access
+```
+
+Auth0, Okta and Entra ID all require `offline_access`. An application that
+forgets it in production gets no refresh token and breaks, and a lanyard that
+handed one over unasked would hide exactly that bug. (Keycloak issues them
+without it, so if that is what you are calibrated to, this is the sentence that
+saves you an afternoon.)
+
+A refresh token is **opaque and eight hours long** — an unguessable id into an
+in-memory record, not a JWT. It is presented to exactly one endpoint, which has
+the record, and an application that "validates" a refresh token has a bug that a
+JWT-shaped one would hide. Eight hours is the one lifetime in this project not
+measured in seconds, because a refresh path you cannot exercise across a lunch
+break is a refresh path nobody exercises.
+
+```
+curl -X POST http://127.0.0.1:9500/oidc/token \
+     -d grant_type=refresh_token -d refresh_token=$RT
+```
+
+| Parameter | Required | Meaning |
+|---|---|---|
+| `grant_type` | yes | `refresh_token` |
+| `refresh_token` | yes | The one you were given, or the one the last refresh gave you |
+| `scope` | no | May **narrow** the grant. May not widen it |
+| `client_id` / `client_secret` | no | Accepted in any form, checked in none, as everywhere else |
+
+You get a new access token — 60 seconds, minted by the same function from the
+same stored persona — a new refresh token, and, when the original grant included
+`openid`, a new ID token carrying the same `sub`, the same `auth_time` and **the
+original `nonce`** (OIDC Core §12.2), a fresh `at_hash` over the new access
+token, and no `c_hash`, because there is no code this time.
+
+**They rotate.** Every successful refresh returns a new one and invalidates the
+one you presented. That is what Auth0, Okta and Entra do for public clients, and
+it is the strictly more demanding shape: an application that handles rotation
+handles a static token too, and the reverse is the bug you want to find locally.
+
+Four `invalid_grant` descriptions, told apart on purpose, because they are four
+different problems:
+
+```
+that refresh token has already been exchanged; lanyard rotates refresh tokens…
+that refresh token has expired; refresh tokens live eight hours…
+no such refresh token; it was never issued, or lanyard was restarted since…
+that refresh token has been revoked, either at /oidc/revoke or by logging out…
+```
+
+Narrowing succeeds and the response echoes the narrowed `scope`; widening is
+`400 invalid_scope` **naming the offending value** (RFC 6749 §6). A refusal
+costs you nothing — the refresh token you presented still works, because it is
+only spent once nothing is left to refuse.
+
+## Introspection and revocation
+
+```
+curl -X POST http://127.0.0.1:9500/oidc/introspect -d token=$TOKEN
+curl -X POST http://127.0.0.1:9500/oidc/revoke     -d token=$TOKEN
+```
+
+`/oidc/introspect` (RFC 7662) always answers `200 application/json`. A live
+access token comes back with `active: true` and `sub`, `client_id`, `aud`,
+`scope`, `iss`, `exp`, `iat` and `jti` — only the fields the token actually
+carried. **Everything else is exactly `{"active": false}` and nothing more**: a
+token signed by another issuer, a string that is not a JWT, an empty `token`, a
+revoked token and an expired one are one answer, because RFC 7662 §2.2 says an
+inactive response reveals no other fields. Which kind of nothing it was is a
+question for the request log, not for this endpoint.
+
+`/oidc/revoke` (RFC 7009) always answers `200` with an **empty body**, including
+for a token that was never issued or is not a JWT — §2.2 requires exactly that,
+so a client cannot use it to find out whether a token exists.
+
+- A **refresh token** is dropped, and the next refresh with it names revocation.
+- An **access token** has its `jti` remembered until the moment the token would
+  have expired anyway, and then forgotten. Access tokens stay stateless JWTs;
+  this is the only way revoking one can mean anything, and the set is bounded by
+  the number of unexpired tokens.
+- **No cascade.** Revoking a refresh token does not revoke access tokens issued
+  from it, and revoking an access token does not touch the refresh token. RFC
+  7009 §2.1 says a server MAY cascade; lanyard does not track the linkage, and
+  inventing one to support a MAY is how a dev tool grows a subsystem nobody asked
+  for.
+
+**`/oidc/userinfo` honours revocation** — a revoked access token gets `401` there
+too. `/introspect` saying `active: false` while `/userinfo` handed over claims
+would be lanyard disagreeing with itself.
+
+**Neither endpoint authenticates the client, and RFC 7662 §2.1 says
+introspection MUST.** This is a deliberate divergence, it is [the same one
+`/oidc/token` already ships](#the-token-endpoint), and the mitigation is the same
+one: lanyard binds to loopback, and anyone who can reach the port can mint
+anything anyway. An introspection endpoint demanding a credential lanyard does
+not check would be theatre with extra steps.
 
 ## The test seam
 

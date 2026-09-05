@@ -4,10 +4,14 @@
 pub mod authorize;
 pub mod code;
 pub mod cors;
+pub mod end_session;
 pub mod flaw;
+pub mod introspect;
 pub mod issue;
 pub mod jws;
 pub mod redirect_uri;
+pub mod revocation;
+pub mod revoke;
 pub mod routes;
 pub mod scope;
 pub mod token;

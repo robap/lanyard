@@ -102,6 +102,22 @@ impl Config {
         format!("{}/userinfo", self.issuer)
     }
 
+    /// **.NET builds its logout redirect by reading this URL out of the
+    /// discovery document**, and silently builds no redirect when it is absent.
+    /// The endpoint and its advertisement ship together or the one-liner in the
+    /// spike is quietly a no-op.
+    pub fn end_session_endpoint(&self) -> String {
+        format!("{}/end_session", self.issuer)
+    }
+
+    pub fn introspection_endpoint(&self) -> String {
+        format!("{}/introspect", self.issuer)
+    }
+
+    pub fn revocation_endpoint(&self) -> String {
+        format!("{}/revoke", self.issuer)
+    }
+
     /// The persona picker, for the banner to print. Derived from the issuer
     /// rather than from the bind address, because the issuer is the one address
     /// everything else in this file is derived from — and because a banner that
@@ -156,6 +172,15 @@ mod tests {
             "http://127.0.0.1:9500/oidc/authorize"
         );
         assert_eq!(c.userinfo_endpoint(), "http://127.0.0.1:9500/oidc/userinfo");
+        assert_eq!(
+            c.end_session_endpoint(),
+            "http://127.0.0.1:9500/oidc/end_session"
+        );
+        assert_eq!(
+            c.introspection_endpoint(),
+            "http://127.0.0.1:9500/oidc/introspect"
+        );
+        assert_eq!(c.revocation_endpoint(), "http://127.0.0.1:9500/oidc/revoke");
         // The banner prints this and criterion 25 fetches it, so the `/oidc`
         // segment has to come back off.
         assert_eq!(c.ui_url(), "http://127.0.0.1:9500/_/");

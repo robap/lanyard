@@ -1,0 +1,5 @@
+Criterion 15 — every request the SPA made across one automaticSilentRenew.
+No /authorize, no sub_frame, and the address bar never moved.
+
+POST fetch      http://127.0.0.1:9500/oidc/token
+     grant_type=refresh_token&refresh_token=90af32ff51e84df4ae6110f74a7e4b6b&scope=openid+email+profile+offline_access&client_id=node-spa

@@ -125,7 +125,7 @@ async fn discovery_advertises_only_what_exists() {
     assert_eq!(doc["token_endpoint"], format!("{ISSUER}/token"));
     assert_eq!(
         doc["grant_types_supported"],
-        serde_json::json!(["client_credentials", "authorization_code"])
+        serde_json::json!(["client_credentials", "authorization_code", "refresh_token"])
     );
 
     // Phase 4 implemented these two, so the document says so.
@@ -141,7 +141,7 @@ async fn discovery_advertises_only_what_exists() {
     );
     assert_eq!(
         doc["scopes_supported"],
-        serde_json::json!(["openid", "email", "profile"])
+        serde_json::json!(["openid", "email", "profile", "offline_access"])
     );
 
     // **Exactly `["code"]`.** Phase 1 wrote `["id_token", "code"]` when nothing
@@ -159,16 +159,46 @@ async fn discovery_advertises_only_what_exists() {
         serde_json::json!(["none", "client_secret_basic", "client_secret_post"])
     );
 
-    // Honest, not aspirational: an advertised endpoint that 404s sends a client
-    // down a path that fails later and further away.
-    for unimplemented in [
-        "end_session_endpoint",
-        "introspection_endpoint",
-        "revocation_endpoint",
+    // **The phase where "advertise only what exists" cuts the other way.** Until
+    // Phase 5 this loop asserted these three were *absent*; now they exist, and
+    // .NET reads `end_session_endpoint` out of this document to build its logout
+    // redirect — so an endpoint that exists and is not advertised fails exactly
+    // as confusingly as one advertised and missing. This asserts both halves:
+    // the URL is there, and it answers.
+    for (advertised, path) in [
+        ("end_session_endpoint", "end_session"),
+        ("introspection_endpoint", "introspect"),
+        ("revocation_endpoint", "revoke"),
     ] {
+        assert_eq!(
+            doc[advertised],
+            format!("{ISSUER}/{path}"),
+            "{advertised} has to be in the document in the phase that implements it"
+        );
+        let res = reqwest::Client::new()
+            .post(format!("{base}/oidc/{path}"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("")
+            .send()
+            .await
+            .unwrap();
         assert!(
-            doc.get(unimplemented).is_none(),
-            "{unimplemented} is advertised but not implemented until a later phase"
+            res.status().as_u16() < 400,
+            "{advertised} is advertised and does not answer: {}",
+            res.status()
+        );
+    }
+
+    // All three are true here for the same reason they are true at the token
+    // endpoint: none of them are checked.
+    for methods in [
+        "introspection_endpoint_auth_methods_supported",
+        "revocation_endpoint_auth_methods_supported",
+    ] {
+        assert_eq!(
+            doc[methods],
+            serde_json::json!(["none", "client_secret_basic", "client_secret_post"]),
+            "{methods}"
         );
     }
 }
@@ -1118,4 +1148,286 @@ async fn the_jwks_is_unchanged_after_minting_every_flaw() {
     assert!(!serde_json::to_string(&after)
         .unwrap()
         .contains("lanyard-unknown-kid"));
+}
+
+// ------------------------------------------------------------ introspect --
+//
+// RFC 7662. Always `200`, and everything unrecognized is exactly
+// `{"active": false}` — §2.2 says an inactive response reveals no other fields.
+
+/// Form-encoded, as RFC 7662 §2.1 requires, and with whatever client
+/// authentication the caller felt like sending.
+async fn post_form(base: &str, path: &str, body: &str) -> (u16, String) {
+    let res = reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    (res.status().as_u16(), res.text().await.unwrap())
+}
+
+async fn introspect(base: &str, body: &str) -> serde_json::Value {
+    let (status, text) = post_form(base, "/oidc/introspect", body).await;
+    assert_eq!(status, 200, "introspection always answers 200: {text}");
+    serde_json::from_str(&text).expect("introspection is JSON")
+}
+
+/// An access token minted through the seam, which signs with the same key
+/// `/oidc/token` does — so introspection cannot tell them apart, which is the
+/// point.
+async fn an_access_token(base: &str, query: &str) -> String {
+    let (_, body) = post_token(
+        base,
+        query,
+        r#"{"client_id":"billing-web","scope":"openid email"}"#,
+    )
+    .await;
+    body["token"].as_str().unwrap().to_string()
+}
+
+/// A real RS256 token, signed by a key that is not lanyard's. It is
+/// well-formed, unexpired, and names lanyard as its issuer — everything except
+/// the signature is right, so this is the assertion that the signature is
+/// actually checked.
+fn a_foreign_token() -> String {
+    let key = lanyard_cli::keys::SigningKey::from_pem(include_str!("data/other-key.pem")).unwrap();
+    let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
+        serde_json::json!({ "sub": "ada", "iss": ISSUER, "exp": now() + 300, "jti": "foreign" }),
+    )
+    .unwrap();
+    lanyard_cli::oidc::jws::sign(&key, &claims, None).unwrap()
+}
+
+#[tokio::test]
+async fn introspecting_a_live_access_token_describes_it() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+
+    let out = introspect(&base, &format!("token={token}")).await;
+    assert_eq!(out["active"], true);
+    assert_eq!(out["token_type"], "Bearer");
+    assert_eq!(out["sub"], "ada");
+    assert_eq!(out["client_id"], "billing-web");
+    assert_eq!(out["scope"], "openid email");
+    assert_eq!(out["iss"], ISSUER);
+    assert!(out["exp"].is_number() && out["iat"].is_number());
+    assert!(out["jti"].is_string(), "the jti is what a revocation names");
+}
+
+/// Only what the token carried. An access token with no `aud` is legitimate —
+/// it is what an API that forgets to validate audience will happily accept —
+/// and reporting one it does not have would be a lie about the token.
+#[tokio::test]
+async fn introspection_reports_no_audience_when_the_token_has_none() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+    let out = introspect(&base, &format!("token={token}")).await;
+    assert!(out.get("aud").is_none(), "{out}");
+}
+
+/// **Exactly two words** for every kind of nothing. RFC 7662 §2.2: an inactive
+/// response reveals no other fields, so expired, foreign, malformed, absent and
+/// never-issued are one answer.
+#[tokio::test]
+async fn everything_unrecognized_is_exactly_active_false() {
+    let base = spawn().await;
+    let expired = {
+        let (_, body) = post_token(&base, "?persona=ada&flaw=expired", "{}").await;
+        body["token"].as_str().unwrap().to_string()
+    };
+
+    for body in [
+        String::new(),
+        "token=".to_string(),
+        "token=not-a-jwt".to_string(),
+        "token=a.b.c".to_string(),
+        format!("token={expired}"),
+        format!("token={}", a_foreign_token()),
+        "token=some-refresh-token-nobody-issued".to_string(),
+    ] {
+        let out = introspect(&base, &body).await;
+        assert_eq!(
+            out,
+            serde_json::json!({ "active": false }),
+            "{body:?} must produce exactly two words and nothing more"
+        );
+    }
+}
+
+/// North star 1 arriving at a third endpoint. RFC 7662 §2.1 says the client
+/// MUST be authenticated here; lanyard accepts every form of it and checks
+/// none, exactly as `/oidc/token` already does.
+#[tokio::test]
+async fn client_authentication_is_accepted_in_any_form_and_checked_in_none() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+
+    // Form parameters.
+    let out = introspect(
+        &base,
+        &format!("token={token}&client_id=whoever&client_secret=nonsense"),
+    )
+    .await;
+    assert_eq!(out["active"], true);
+
+    // HTTP Basic, and none at all.
+    let res = reqwest::Client::new()
+        .post(format!("{base}/oidc/introspect"))
+        .header("authorization", "Basic bm90OmNoZWNrZWQ=")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(
+        res.json::<serde_json::Value>().await.unwrap()["active"],
+        true
+    );
+}
+
+/// RFC 7662 §2.1: a server MUST NOT refuse a request because the hint was
+/// wrong. The string is identified by what it is, not by what it was announced
+/// as.
+#[tokio::test]
+async fn a_wrong_token_type_hint_is_read_as_a_hint_and_nothing_more() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+    let out = introspect(
+        &base,
+        &format!("token={token}&token_type_hint=refresh_token"),
+    )
+    .await;
+    assert_eq!(out["active"], true, "the hint was wrong and did not matter");
+}
+
+// ---------------------------------------------------------------- revoke --
+//
+// RFC 7009. **Always `200` with an empty body**, including for a token that was
+// never issued or is not a JWT — §2.2 requires exactly that, so a client cannot
+// use this endpoint to find out whether a token exists.
+
+async fn revoke(base: &str, body: &str) {
+    let (status, text) = post_form(base, "/oidc/revoke", body).await;
+    assert_eq!(status, 200, "revocation always answers 200: {text}");
+    assert_eq!(text, "", "and an empty body");
+}
+
+async fn userinfo_status(base: &str, token: &str) -> (u16, Option<String>) {
+    let res = reqwest::Client::new()
+        .get(format!("{base}/oidc/userinfo"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    let challenge = res
+        .headers()
+        .get("www-authenticate")
+        .map(|v| v.to_str().unwrap().to_string());
+    (res.status().as_u16(), challenge)
+}
+
+/// Criterion 16, at the HTTP level: introspection flips, and `/userinfo` agrees.
+/// `/introspect` saying `active: false` while `/userinfo` hands over claims
+/// would be lanyard disagreeing with itself.
+#[tokio::test]
+async fn revoking_an_access_token_flips_introspection_and_closes_userinfo() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+
+    assert_eq!(
+        introspect(&base, &format!("token={token}")).await["active"],
+        true
+    );
+    assert_eq!(userinfo_status(&base, &token).await.0, 200);
+
+    revoke(&base, &format!("token={token}")).await;
+
+    assert_eq!(
+        introspect(&base, &format!("token={token}")).await,
+        serde_json::json!({ "active": false }),
+        "exactly two words after revocation too"
+    );
+    let (status, challenge) = userinfo_status(&base, &token).await;
+    assert_eq!(status, 401);
+    let challenge = challenge.expect("RFC 6750 §3's header");
+    assert!(challenge.contains("invalid_token"), "{challenge}");
+}
+
+/// Criterion 17. RFC 7009 §2.2: a client must not be able to probe existence
+/// here, so a token nobody issued and a string that is not a JWT get the same
+/// `200` a real one does.
+#[tokio::test]
+async fn revoking_something_that_was_never_issued_is_still_two_hundred_and_empty() {
+    let base = spawn().await;
+    for body in [
+        String::new(),
+        "token=".to_string(),
+        "token=not-a-jwt".to_string(),
+        "token=some-refresh-token-nobody-issued".to_string(),
+        format!("token={}", a_foreign_token()),
+        format!("token={}&token_type_hint=refresh_token", a_foreign_token()),
+    ] {
+        revoke(&base, &body).await;
+    }
+    // And a foreign token still introspects as inactive rather than as an
+    // error, before and after.
+    assert_eq!(
+        introspect(&base, &format!("token={}", a_foreign_token())).await,
+        serde_json::json!({ "active": false })
+    );
+}
+
+/// Revoking somebody else's token must not revoke ours: the set is keyed on
+/// the `jti`, and a foreign token's `jti` never enters it because the token
+/// never verified.
+#[tokio::test]
+async fn revoking_a_foreign_token_does_not_touch_a_real_one() {
+    let base = spawn().await;
+    let mine = an_access_token(&base, "?persona=ada").await;
+    revoke(&base, &format!("token={}", a_foreign_token())).await;
+    assert_eq!(
+        introspect(&base, &format!("token={mine}")).await["active"],
+        true
+    );
+}
+
+/// Client authentication is accepted in any form and checked in none, here too.
+#[tokio::test]
+async fn revocation_accepts_any_client_authentication() {
+    let base = spawn().await;
+    let token = an_access_token(&base, "?persona=ada").await;
+    let res = reqwest::Client::new()
+        .post(format!("{base}/oidc/revoke"))
+        .header("authorization", "Basic bm90OmNoZWNrZWQ=")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!("token={token}&client_id=whoever"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(
+        introspect(&base, &format!("token={token}")).await["active"],
+        false
+    );
+}
+
+/// A revoked `jti` is forgotten at the moment its token would have expired
+/// anyway, which is what bounds the set. Proved through the front door: two
+/// tokens revoked, and the set holds only the one still alive.
+#[tokio::test]
+async fn a_revocation_is_not_recorded_for_a_token_that_has_already_expired() {
+    let base = spawn().await;
+    let (_, body) = post_token(&base, "?persona=ada&flaw=expired", "{}").await;
+    let expired = body["token"].as_str().unwrap().to_string();
+
+    revoke(&base, &format!("token={expired}")).await;
+    // It was already inactive, and it still is — nothing was remembered about
+    // a token there was nothing left to revoke.
+    assert_eq!(
+        introspect(&base, &format!("token={expired}")).await,
+        serde_json::json!({ "active": false })
+    );
 }
