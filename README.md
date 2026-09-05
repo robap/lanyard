@@ -5,6 +5,8 @@ A local OIDC provider with nothing to configure.
 `lanyard serve` starts an OpenID Connect provider on `127.0.0.1:9500` with a
 working discovery document, a stable signing key and three ready-made users. No
 realm to create, no client to register, no admin console to visit.
+`lanyard token --as ada --aud billing-api` prints a bearer token you can paste
+into a `curl`.
 
 ## Build and run
 
@@ -38,10 +40,11 @@ and a wiped data directory does not invalidate a cached JWKS. Anyone with a
 checkout can mint a token your application will accept. Never expose lanyard to
 an untrusted network, and never point a staging or production service at it.
 
-`POST /_/api/token` compounds this: it mints any claims anyone asks for, with no
-authentication at all. That is the entire point of a test seam, and it is why
-the default bind is loopback. `LANYARD_BIND=0.0.0.0` turns that off, so do it
-only on a network you control.
+`POST /_/api/token` and `POST /oidc/token` compound this: between them they mint
+any claims for anyone who can reach the port, with no authentication at all. That
+is the entire point — a test seam and a provider with no client registry — and it
+is why the default bind is loopback. `LANYARD_BIND=0.0.0.0` turns that off, so do
+it only on a network you control.
 
 **The issuer is `http://127.0.0.1:9500/oidc`**, path segment included, and it
 does not follow the `Host` header. Reaching lanyard at `http://localhost:9500`
@@ -55,14 +58,36 @@ will actually use:
 LANYARD_ISSUER=http://lanyard:9500/oidc lanyard serve
 ```
 
-**The discovery document lists only the endpoints that exist.** Today `jwks_uri`
-is the only endpoint in it; there is no `authorization_endpoint` yet, because
-advertising an endpoint that returns 404 sends a client down a path that cannot
-work. The document grows each phase.
+**The discovery document lists only the endpoints that exist.** Today that is
+`jwks_uri` and `token_endpoint`; there is no `authorization_endpoint` yet,
+because advertising an endpoint that returns 404 sends a client down a path that
+cannot work. The document grows each phase. (.NET's `AddJwtBearer` consumes a
+document with no `authorization_endpoint` without complaint — observed, not
+assumed.)
 
-**Scope.** This is Phase 1. There is a discovery document, a JWKS, and the test
-seam below. There is no `/authorize`, no `/oidc/token`, no browser login, no web
-UI and no `lanyard token` CLI command yet.
+**Any `aud` mints.** `--aud not-a-real-api` is a token, not an error. Audiences
+follow the same no-registration rule as everything else, and an audience your API
+does not expect is a test case worth having. Rejection happens at the API, not
+here.
+
+**A 60-second token stays valid for about six minutes against a stock .NET API.**
+`TokenValidationParameters.ClockSkew` defaults to **five minutes**, so a
+default-configured `AddJwtBearer` keeps accepting a lanyard token long after it
+expired. If you cannot make short-TTL rejection happen locally you will conclude
+lanyard's lifetimes are fake; they are not, your resource server is being
+generous. One line fixes it:
+
+```csharp
+options.TokenValidationParameters.ClockSkew = TimeSpan.Zero;
+```
+
+Measured both ways in [`docs/decisions/dotnet-jwt-bearer-settings.md`](docs/decisions/dotnet-jwt-bearer-settings.md).
+
+**Scope.** This is Phase 2. There is a discovery document, a JWKS, the
+`client_credentials` half of `/oidc/token`, the `token` and `env` CLI commands,
+and the test seam. There is no `/authorize`, no `authorization_code` grant, no
+`/userinfo`, no browser login and no web UI yet — and no deliberately-wrong
+tokens (`--expired`, `--wrong-aud`, …) yet either.
 
 ## Configuration
 
@@ -75,6 +100,13 @@ Every setting is an environment variable read once at startup. All are optional.
 | `LANYARD_PORT` | `9500` | Listen port |
 | `LANYARD_DATA_DIR` | `$XDG_DATA_HOME/lanyard` | Signing key lives here |
 | `LANYARD_PERSONAS` | `$XDG_CONFIG_HOME/lanyard/users.yaml` | Persona file; when set, it must exist |
+| `LANYARD_URL` | `http://127.0.0.1:{port}` | Where `lanyard token` and `lanyard env` reach the server |
+
+`LANYARD_URL` is an address; `LANYARD_ISSUER` is a string that goes in a token.
+They are deliberately separate knobs. Set the issuer to `http://lanyard:9500/oidc`
+for a container network and that name resolves nowhere useful from your shell — a
+CLI that derived its target from the issuer would be unreachable in exactly the
+setup the issuer setting exists to support.
 
 On first run the data directory is created containing `signing-key.pem` (mode
 `0600`, seeded from the built-in default key) and a `.gitignore`. Replace
@@ -122,6 +154,87 @@ later as a name missing from the picker.
 
 `client:` is accepted at both levels, echoed back by `/_/api/personas`, and read
 by nothing yet.
+
+## Minting a token from the command line
+
+Probably the larger half of daily use, and the shorter path to being useful:
+there is no redirect dance to get right.
+
+```
+$ lanyard token --as ada --aud billing-api
+eyJhbGciOiJSUzI1NiIsImtpZCI6...
+
+$ curl -H "Authorization: Bearer $(lanyard token --as ada --aud billing-api)" \
+       localhost:8080/orders
+```
+
+`lanyard token` prints the token and a newline on stdout and nothing else — no
+banner, no timing, no "minted for Ada" — so `$(...)` drops it straight into a
+header. On failure **stdout stays empty**, the message goes to stderr and the
+exit code is non-zero, because an API receiving the words "connection refused" as
+a credential is worse than an API receiving nothing.
+
+```
+$ lanyard token --as ada
+lanyard: nothing listening at http://127.0.0.1:9500 — is `lanyard serve` running?
+```
+
+`lanyard env` prints the same token shaped for `eval`:
+
+```
+$ eval "$(lanyard env --as ada --aud billing-api)"
+$ echo $BEARER_TOKEN
+eyJhbGciOiJSUzI1NiIsImtpZCI6...
+```
+
+The variable name is fixed at `BEARER_TOKEN`. When minting fails, `lanyard env`
+prints nothing at all on stdout, so `eval "$(...)"` is a no-op that leaves your
+shell exactly as it was.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--as` | *required* | Persona to mint for |
+| `--aud` | none | The `aud` claim. Any value mints |
+| `--scope` | none | Space-delimited, becomes the `scope` claim |
+| `--url` | `$LANYARD_URL`, else `http://127.0.0.1:9500` | Where lanyard is listening |
+
+The CLI does not sign locally. It performs a real `client_credentials` grant
+against `/oidc/token`, so the token arrives the way a production token arrives —
+through the endpoint an SDK would use. Tokens are 60 seconds and the TTL is not
+configurable.
+
+## The token endpoint
+
+`POST /oidc/token`, `application/x-www-form-urlencoded`. This is what the CLI
+calls, and what an SDK doing client credentials will find in the discovery
+document.
+
+```
+curl -X POST http://127.0.0.1:9500/oidc/token \
+     -d grant_type=client_credentials -d persona=ada -d audience=billing-api
+```
+
+```json
+{ "access_token": "eyJhbGciOiJSUzI1NiIs…", "token_type": "Bearer", "expires_in": 60 }
+```
+
+| Parameter | Required | Meaning |
+|---|---|---|
+| `grant_type` | yes | Must be `client_credentials`. Anything else is `400 unsupported_grant_type` |
+| `persona` | no | A loaded persona id. Unknown ids are a `400` naming the id |
+| `audience` | no | The `aud` claim. `resource` (RFC 8707) is a synonym; `audience` wins |
+| `scope` | no | Space-delimited. Becomes the `scope` claim and is echoed in the response |
+| `client_id` / `client_secret` | no | Never validated. `client_id` becomes a claim when sent |
+
+**Client authentication is accepted in any form and checked in none.** HTTP
+Basic, form parameters, or nothing at all — all four combinations mint. This is
+the endpoint where every other provider would put a client registry, and it is
+what lets three services on three ports share one running instance with no setup
+between them.
+
+There is no `id_token` (client credentials has no user authentication event to
+attest to) and no `refresh_token`. Unknown parameters are ignored. Errors are
+`400` with `{"error", "error_description"}`.
 
 ## The test seam
 

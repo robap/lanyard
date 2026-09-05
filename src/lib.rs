@@ -6,6 +6,7 @@
 pub mod app;
 pub mod b64;
 pub mod banner;
+pub mod client;
 pub mod config;
 pub mod keys;
 pub mod oidc;

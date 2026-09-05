@@ -4,3 +4,4 @@
 pub mod issue;
 pub mod jws;
 pub mod routes;
+pub mod token;

@@ -89,6 +89,10 @@ impl Config {
     pub fn jwks_uri(&self) -> String {
         format!("{}/jwks", self.issuer)
     }
+
+    pub fn token_endpoint(&self) -> String {
+        format!("{}/token", self.issuer)
+    }
 }
 
 /// XDG by hand rather than via `directories`, which would return
@@ -130,6 +134,7 @@ mod tests {
         let c = Config::resolve(env(&[("HOME", "/home/dev")])).unwrap();
         assert_eq!(c.issuer, "http://127.0.0.1:9500/oidc");
         assert_eq!(c.jwks_uri(), "http://127.0.0.1:9500/oidc/jwks");
+        assert_eq!(c.token_endpoint(), "http://127.0.0.1:9500/oidc/token");
     }
 
     #[test]

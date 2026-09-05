@@ -31,8 +31,12 @@ sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 serde_norway = "0.9.42"
+serde_urlencoded = "0.7"
+# The CLI performs a real `client_credentials` grant rather than signing locally,
+# so `reqwest` is a runtime dependency now. `default-features = false` keeps a TLS
+# stack out of the binary: `LANYARD_URL` is http-only until HTTPS lands post-v1.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form"] }
 
 [dev-dependencies]
-reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

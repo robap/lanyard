@@ -112,11 +112,23 @@ async fn discovery_advertises_only_what_exists() {
     assert!(doc["response_types_supported"].is_array());
     assert!(doc["subject_types_supported"].is_array());
 
+    // The document stays honest in both directions: it advertises the token
+    // endpoint in the phase that implements it.
+    assert_eq!(doc["token_endpoint"], format!("{ISSUER}/token"));
+    assert_eq!(
+        doc["grant_types_supported"],
+        serde_json::json!(["client_credentials"])
+    );
+    // All three are true, because none of them are checked.
+    assert_eq!(
+        doc["token_endpoint_auth_methods_supported"],
+        serde_json::json!(["none", "client_secret_basic", "client_secret_post"])
+    );
+
     // Honest, not aspirational: an advertised endpoint that 404s sends a client
     // down a path that fails later and further away.
     for unimplemented in [
         "authorization_endpoint",
-        "token_endpoint",
         "userinfo_endpoint",
         "end_session_endpoint",
         "introspection_endpoint",
@@ -146,6 +158,7 @@ async fn the_issuer_does_not_follow_the_host_header() {
     // different Host and must still name the one configured issuer.
     assert_eq!(doc["issuer"], ISSUER);
     assert_eq!(doc["jwks_uri"], format!("{ISSUER}/jwks"));
+    assert_eq!(doc["token_endpoint"], format!("{ISSUER}/token"));
 }
 
 // ---------------------------------------------------------------- the seam --
@@ -309,4 +322,416 @@ async fn personas_echoes_client_at_both_levels() {
     assert_eq!(list.len(), 2);
     assert!(list[0].get("client").is_none());
     assert_eq!(list[1]["client"], "ops-console");
+}
+
+// ----------------------------------------------------------- /oidc/token --
+//
+// The second caller of `oidc::issue`, and the first one a real SDK would use.
+// The handler builds no claims: it maps form parameters to an overrides map and
+// calls the one function (north star 3).
+
+/// Post a `client_credentials`-shaped form the way `curl -d` does, and hand back
+/// enough of the response to assert on the OAuth envelope as well as the body.
+async fn post_grant(
+    base: &str,
+    form: &[(&str, &str)],
+) -> (u16, reqwest::header::HeaderMap, serde_json::Value) {
+    let res = reqwest::Client::new()
+        .post(format!("{base}/oidc/token"))
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let headers = res.headers().clone();
+    (status, headers, res.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn the_grant_mints_a_persona_token() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["expires_in"], 60);
+
+    let token = body["access_token"].as_str().expect("access_token");
+    let claims = payload_of(token);
+    assert_eq!(claims["sub"], "ada");
+    assert_eq!(claims["email"], "ada@example.test");
+    assert_eq!(claims["iss"], ISSUER);
+    assert_eq!(
+        claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
+        60,
+        "the grant uses the default TTL, not one of its own"
+    );
+}
+
+/// North star 1, arriving at the endpoint where every other IdP would put a
+/// client registry. All four shapes mint.
+#[tokio::test]
+async fn any_client_authentication_mints_and_so_does_none() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    let grant = [("grant_type", "client_credentials"), ("persona", "ada")];
+
+    let none = client.post(format!("{base}/oidc/token")).form(&grant);
+    let basic = client
+        .post(format!("{base}/oidc/token"))
+        .basic_auth("anything", Some("whatever"))
+        .form(&grant);
+    let post = client.post(format!("{base}/oidc/token")).form(&[
+        ("grant_type", "client_credentials"),
+        ("persona", "ada"),
+        ("client_id", "x"),
+        ("client_secret", "y"),
+    ]);
+    let id_only = client.post(format!("{base}/oidc/token")).form(&[
+        ("grant_type", "client_credentials"),
+        ("persona", "ada"),
+        ("client_id", "x"),
+    ]);
+
+    for (label, request) in [
+        ("no client auth", none),
+        ("basic", basic),
+        ("client_secret_post", post),
+        ("client_id alone", id_only),
+    ] {
+        let res = request.send().await.unwrap();
+        assert_eq!(res.status().as_u16(), 200, "{label} was rejected");
+    }
+}
+
+#[tokio::test]
+async fn client_id_becomes_a_claim_when_the_request_supplies_one() {
+    let base = spawn().await;
+
+    // Absent when nothing was sent — a token that claims a client it was never
+    // given would be a lie Phase 6's log and Phase 7's namespacing would key on.
+    let (_, _, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+    let claims = payload_of(body["access_token"].as_str().unwrap());
+    assert!(
+        claims.as_object().unwrap().get("client_id").is_none(),
+        "no client_id was sent, so none belongs in the token: {claims}"
+    );
+
+    // From the form.
+    let (_, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("client_id", "billing-web"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["client_id"],
+        "billing-web"
+    );
+
+    // From HTTP Basic, whose username is the client id per RFC 6749 §2.3.1.
+    let body: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/oidc/token"))
+        .basic_auth("ops-console", Some("unchecked"))
+        .form(&[("grant_type", "client_credentials"), ("persona", "ada")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["client_id"],
+        "ops-console"
+    );
+}
+
+#[tokio::test]
+async fn audience_becomes_aud_and_resource_is_a_synonym() {
+    let base = spawn().await;
+
+    let (_, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("audience", "billing-api"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["aud"],
+        "billing-api"
+    );
+
+    // RFC 8707 spells it `resource`; Auth0 taught everyone `audience`. Both
+    // work, so a real SDK doing client credentials mints whichever it sends.
+    let (_, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("resource", "billing-api"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["aud"],
+        "billing-api"
+    );
+
+    // `audience` wins if both are sent.
+    let (_, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("resource", "from-resource"),
+            ("audience", "from-audience"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["aud"],
+        "from-audience"
+    );
+}
+
+/// A token with no `aud` is legitimate and useful: it is what an API that
+/// forgets to validate audience will happily accept.
+#[tokio::test]
+async fn no_audience_asked_for_means_no_aud_key_at_all() {
+    let base = spawn().await;
+    let (_, _, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+    let claims = payload_of(body["access_token"].as_str().unwrap());
+    assert!(
+        claims.as_object().unwrap().get("aud").is_none(),
+        "an empty or null aud is not the same as no aud: {claims}"
+    );
+}
+
+#[tokio::test]
+async fn scope_becomes_a_claim_and_is_echoed_in_the_response() {
+    let base = spawn().await;
+    let (_, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("scope", "orders:read orders:write"),
+        ],
+    )
+    .await;
+
+    assert_eq!(body["scope"], "orders:read orders:write");
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["scope"],
+        "orders:read orders:write"
+    );
+}
+
+#[tokio::test]
+async fn the_response_envelope_is_no_store_and_carries_nothing_extra() {
+    let base = spawn().await;
+    let (status, headers, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+
+    let object = body.as_object().unwrap();
+    // No `scope` unless one was requested; never an `id_token`, because client
+    // credentials has no user authentication event to attest to; never a
+    // `refresh_token`, because there is nothing to refresh.
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["access_token", "expires_in", "token_type"]);
+}
+
+// The endpoint's 4xx shapes. Every one of them is ours and carries the OAuth
+// `{"error","error_description"}` envelope — never axum's 415 or 422.
+
+async fn post_raw(base: &str, content_type: Option<&str>, body: &str) -> (u16, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .post(format!("{base}/oidc/token"))
+        .body(body.to_string());
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    let res = request.send().await.unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn an_unimplemented_grant_is_unsupported_and_a_missing_one_is_invalid() {
+    let base = spawn().await;
+
+    let (status, _, body) = post_grant(&base, &[("grant_type", "password")]).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"], "unsupported_grant_type");
+    assert!(body["error_description"]
+        .as_str()
+        .unwrap()
+        .contains("password"));
+
+    // Nothing was named, so nothing can be unsupported.
+    for form in [vec![("persona", "ada")], vec![("grant_type", "")]] {
+        let (status, _, body) = post_grant(&base, &form).await;
+        assert_eq!(status, 400, "{form:?} should be invalid_request");
+        assert_eq!(body["error"], "invalid_request", "for {form:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_persona_on_the_grant_is_a_400_naming_the_id() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "nope")],
+    )
+    .await;
+
+    assert_eq!(status, 400);
+    assert_eq!(body["error"], "invalid_request");
+    assert!(
+        body["error_description"].as_str().unwrap().contains("nope"),
+        "the CLI surfaces this description verbatim, so it must name the id"
+    );
+
+    // Still serving.
+    let (status, _, _) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+/// Unknown parameters are ignored, per OAuth's own rule. This is the extension
+/// point: Phase 3's `flaw=alg-none` and Phase 4's `code`/`code_verifier` land
+/// here without touching the contract.
+#[tokio::test]
+async fn unknown_parameters_are_ignored() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("flaw", "alg-none"),
+            ("code_verifier", "not-a-thing-yet"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let claims = payload_of(body["access_token"].as_str().unwrap());
+    for ignored in ["flaw", "code_verifier"] {
+        assert!(
+            claims.as_object().unwrap().get(ignored).is_none(),
+            "{ignored} leaked into the claims"
+        );
+    }
+}
+
+/// The content-type header is not consulted at all: a well-formed body mints
+/// whatever curl did or did not label it, and an unreadable one is our 400
+/// rather than axum's 415 or 422.
+#[tokio::test]
+async fn the_body_is_read_without_consulting_the_content_type() {
+    let base = spawn().await;
+
+    for content_type in [
+        None,
+        Some("application/x-www-form-urlencoded"),
+        Some("text/plain"),
+    ] {
+        let (status, body) = post_raw(
+            &base,
+            content_type,
+            "grant_type=client_credentials&persona=ada",
+        )
+        .await;
+        assert_eq!(status, 200, "content-type {content_type:?}: {body}");
+    }
+
+    // A body that is not a form at all is not a 415 or a 422 — it is unknown
+    // parameters, and therefore the ordinary "you named no grant" 400.
+    for garbage in [
+        r#"{"grant_type":"client_credentials"}"#,
+        "not a form at all",
+    ] {
+        let (status, body) = post_raw(&base, None, garbage).await;
+        assert_eq!(status, 400, "{garbage:?}");
+        assert_eq!(body["error"], "invalid_request", "{garbage:?}");
+        assert!(body["error_description"].is_string(), "{garbage:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_token_endpoint_is_post_only() {
+    let base = spawn().await;
+    let res = reqwest::get(format!("{base}/oidc/token")).await.unwrap();
+    assert_eq!(res.status().as_u16(), 405);
+}
+
+// ------------------------------------------------ one function, observable --
+
+/// **North star 3, finally falsifiable.** Phase 1 shipped `issue()` with a
+/// single caller, which made "issuance is one function" unfalsifiable. Two
+/// callers — the seam and the grant — must produce the same claim set for the
+/// same request. If claim shaping ever appears in `oidc::token`, this is what
+/// fails.
+#[tokio::test]
+async fn the_seam_and_the_grant_produce_the_same_claims() {
+    let base = spawn().await;
+
+    let (_, seam) = post_token(&base, "?persona=ada", r#"{"aud":"billing-api"}"#).await;
+    let (_, _, grant) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("audience", "billing-api"),
+        ],
+    )
+    .await;
+
+    let mut through_the_seam = seam["claims"].as_object().unwrap().clone();
+    let mut through_the_grant = payload_of(grant["access_token"].as_str().unwrap())
+        .as_object()
+        .unwrap()
+        .clone();
+
+    // The five that are per-request by construction: three timestamps, a fresh
+    // id, and `client_id`, which the grant carries only because the request
+    // supplied one and the seam has nowhere to supply it from.
+    for per_request in ["iat", "nbf", "exp", "jti", "client_id"] {
+        through_the_seam.remove(per_request);
+        through_the_grant.remove(per_request);
+    }
+
+    assert_eq!(through_the_seam, through_the_grant);
+    // Guard against the test passing because both sides are empty.
+    assert_eq!(through_the_grant["sub"], "ada");
+    assert_eq!(through_the_grant["aud"], "billing-api");
+    assert_eq!(through_the_grant["email"], "ada@example.test");
 }
