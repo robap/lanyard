@@ -83,11 +83,11 @@ options.TokenValidationParameters.ClockSkew = TimeSpan.Zero;
 
 Measured both ways in [`docs/decisions/dotnet-jwt-bearer-settings.md`](docs/decisions/dotnet-jwt-bearer-settings.md).
 
-**Scope.** This is Phase 2. There is a discovery document, a JWKS, the
+**Scope.** This is Phase 3. There is a discovery document, a JWKS, the
 `client_credentials` half of `/oidc/token`, the `token` and `env` CLI commands,
-and the test seam. There is no `/authorize`, no `authorization_code` grant, no
-`/userinfo`, no browser login and no web UI yet — and no deliberately-wrong
-tokens (`--expired`, `--wrong-aud`, …) yet either.
+the six deliberate failure flags, and the test seam. There is no `/authorize`,
+no `authorization_code` grant, no `/userinfo`, no browser login and no web UI
+yet.
 
 ## Configuration
 
@@ -197,11 +197,69 @@ shell exactly as it was.
 | `--aud` | none | The `aud` claim. Any value mints |
 | `--scope` | none | Space-delimited, becomes the `scope` claim |
 | `--url` | `$LANYARD_URL`, else `http://127.0.0.1:9500` | Where lanyard is listening |
+| `--expired` | off | Mint a token that expired an hour ago |
+| `--wrong-aud` | off | `aud` becomes `wrong-<requested>` |
+| `--wrong-iss` | off | `iss` becomes `https://wrong-issuer.example.test` |
+| `--bad-signature` | off | One bit of the signature flipped |
+| `--alg-none` | off | An unsecured JWT: `alg: none`, no signature |
+| `--unknown-kid` | off | A real signature under a `kid` in no JWKS |
+
+The six failure flags are mutually exclusive with each other and work on `env`
+too. See [Deliberately wrong tokens](#deliberately-wrong-tokens).
 
 The CLI does not sign locally. It performs a real `client_credentials` grant
 against `/oidc/token`, so the token arrives the way a production token arrives —
 through the endpoint an SDK would use. Tokens are 60 seconds and the TTL is not
 configurable.
+
+## Deliberately wrong tokens
+
+Testing that your API *accepts* a good token is the easy half. Six flags produce
+the tokens that test the other half — each one structurally valid and
+semantically wrong in exactly one way:
+
+```sh
+API=http://127.0.0.1:5080/orders
+code() { curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" $API; }
+
+code "$(lanyard token --as ada --aud billing-api)"                  # 200
+code "$(lanyard token --as ada --aud billing-api --expired)"        # 401
+code "$(lanyard token --as ada --aud billing-api --wrong-aud)"      # 401
+code "$(lanyard token --as ada --aud billing-api --wrong-iss)"      # 401
+code "$(lanyard token --as ada --aud billing-api --bad-signature)"  # 401
+code "$(lanyard token --as ada --aud billing-api --alg-none)"       # 401
+code "$(lanyard token --as ada --aud billing-api --unknown-kid)"    # 401 — or 200; see below
+```
+
+| Flag | What is wrong | What is still right |
+|---|---|---|
+| `--expired` | `iat` = `nbf` = an hour ago, `exp` 60s after that | signature, `kid`, `iss`, `aud`, `sub` |
+| `--wrong-aud` | `aud` becomes `wrong-<what you asked for>` | signature, `kid`, `iss`, lifetime |
+| `--wrong-iss` | `iss` becomes `https://wrong-issuer.example.test` | signature, `kid`, `aud`, lifetime |
+| `--bad-signature` | one bit of the signature is flipped | header byte-for-byte, all claims |
+| `--alg-none` | header is `{"alg":"none","typ":"JWT"}`, no signature at all | all claims |
+| `--unknown-kid` | header `kid` is `lanyard-unknown-kid`, which is in no JWKS | RS256, a real signature, all claims |
+
+**Each flaw breaks exactly one thing**, and that is the whole design. A resource
+server stops at the first check it fails, so a token that is both expired and
+wrongly signed tells you nothing about which check ran. The flags are mutually
+exclusive for the same reason: `--expired --wrong-aud` is a usage error.
+
+**`--expired` is expired by an hour, not by a second**, so it is refused even by
+a resource server with a generous clock tolerance — including a stock .NET API,
+whose default is five minutes.
+
+**If `--unknown-kid` prints `200`, that is a finding about your stack, not a
+bug.** The signature on that token is real; only the `kid` names a key that does
+not exist. A library that honours `kid` refuses it — `jose` does, with
+`JWKSNoMatchingKey`. A library that falls back to trying every key in the JWKS
+accepts it, and **stock .NET `AddJwtBearer` does exactly that** (observed;
+`docs/decisions/dotnet-jwt-bearer-settings.md`). Which half of that you are on
+is worth knowing, and this flag is how you find out.
+
+Nothing about minting a flawed token changes server state: `/oidc/jwks` still
+carries the one real key afterwards. `spikes/dotnet-api/failure-tokens.sh` is
+this block with a `PASS`/`FAIL` line per case.
 
 ## The token endpoint
 
@@ -225,6 +283,7 @@ curl -X POST http://127.0.0.1:9500/oidc/token \
 | `audience` | no | The `aud` claim. `resource` (RFC 8707) is a synonym; `audience` wins |
 | `scope` | no | Space-delimited. Becomes the `scope` claim and is echoed in the response |
 | `client_id` / `client_secret` | no | Never validated. `client_id` becomes a claim when sent |
+| `flaw` | no | One of `expired`, `wrong-aud`, `wrong-iss`, `bad-signature`, `alg-none`, `unknown-kid`. An unrecognized value is a `400`, not an ignored parameter |
 
 **Client authentication is accepted in any form and checked in none.** HTTP
 Basic, form parameters, or nothing at all — all four combinations mint. This is
@@ -255,6 +314,7 @@ curl -sX POST http://127.0.0.1:9500/_/api/token \
 |---|---|---|
 | `persona` | none | Mint a persona's claims: `?persona=ada` |
 | `ttl` | `60` | Lifetime in seconds; `exp - iat` |
+| `flaw` | none | One of the six. Echoed back as `"flaw"`, and an unrecognized value is a `400`, not an ignored parameter |
 
 Body claims override persona claims, and override the registered claims too —
 `iss` and `exp` included — so you can mint a deliberately wrong token:

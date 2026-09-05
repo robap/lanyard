@@ -54,6 +54,9 @@ pub struct MintRequest<'a> {
     pub persona: &'a str,
     pub audience: Option<&'a str>,
     pub scope: Option<&'a str>,
+    /// The wire value of a [`crate::oidc::flaw::Flaw`], passed straight through.
+    /// The CLI does not decide what a flawed token looks like; it asks for one.
+    pub flaw: Option<&'a str>,
 }
 
 /// What went wrong, in the three shapes a user can act on. `Display` is what
@@ -116,6 +119,11 @@ pub async fn mint(request: &MintRequest<'_>) -> Result<String, MintError> {
     }
     if let Some(scope) = request.scope {
         form.push(("scope", scope));
+    }
+    // One more form field, which is the whole of `--bad-signature`: the server
+    // breaks the token, the CLI asks it to.
+    if let Some(flaw) = request.flaw {
+        form.push(("flaw", flaw));
     }
 
     let response = reqwest::Client::new()

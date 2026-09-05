@@ -8,12 +8,25 @@
 use serde_json::{Map, Value};
 
 use crate::keys::SigningKey;
+use crate::oidc::flaw::{self, Flaw};
 use crate::oidc::jws;
 use crate::persona::Persona;
 
 /// Access tokens are 60 seconds by default. Long-lived dev tokens mean the
 /// refresh path never runs locally (CONCEPT §6).
 pub const DEFAULT_TTL: u64 = 60;
+
+/// A minted token, the exact claims that were signed, and the moment they were
+/// minted at.
+///
+/// `issued_at` is here rather than read again by the caller because
+/// `/oidc/token`'s `expires_in` is `exp - issued_at`: a second clock read makes
+/// the ordinary case report 59 or 61 at random.
+pub struct Issued {
+    pub token: String,
+    pub claims: Map<String, Value>,
+    pub issued_at: u64,
+}
 
 /// Mint a signed token and hand back the exact claims that were signed.
 pub fn issue(
@@ -22,10 +35,16 @@ pub fn issue(
     persona: Option<&Persona>,
     overrides: &Map<String, Value>,
     ttl: u64,
-) -> Result<(String, Map<String, Value>), String> {
-    let claims = claims_at(unix_now(), issuer, persona, overrides, ttl, &new_jti());
-    let token = jws::sign(key, &claims)?;
-    Ok((token, claims))
+    flaw: Option<Flaw>,
+) -> Result<Issued, String> {
+    let issued_at = unix_now();
+    let claims = claims_at(issued_at, issuer, persona, overrides, ttl, &new_jti(), flaw);
+    let token = jws::sign(key, &claims, flaw)?;
+    Ok(Issued {
+        token,
+        claims,
+        issued_at,
+    })
 }
 
 /// The claim set, as a pure function of its inputs so the time-dependent parts
@@ -37,6 +56,7 @@ pub fn claims_at(
     overrides: &Map<String, Value>,
     ttl: u64,
     jti: &str,
+    flaw: Option<Flaw>,
 ) -> Map<String, Value> {
     let mut claims = Map::new();
 
@@ -79,6 +99,40 @@ pub fn claims_at(
     //    second code path.
     for (key, value) in overrides {
         claims.insert(key.clone(), value.clone());
+    }
+
+    // 4. The flaw, which outranks even the body — the one reversal of step 3's
+    //    rule. `flaw=expired` returning a live token because the caller happened
+    //    to post an `exp` is a negative test that quietly passes, which is worse
+    //    than no flag at all (north star 4). Anyone who wants an exact `exp` can
+    //    still post one, without a flaw.
+    match flaw {
+        // The whole token shifts back, lifetime intact: a token issued now that
+        // expired an hour ago is a shape no IdP produces, and some libraries
+        // reject it for the wrong reason.
+        Some(Flaw::Expired) => {
+            let iat = now.saturating_sub(flaw::EXPIRED_SHIFT);
+            claims.insert("iat".into(), Value::from(iat));
+            claims.insert("nbf".into(), Value::from(iat));
+            claims.insert("exp".into(), Value::from(iat.saturating_add(ttl)));
+        }
+        // `wrong-<requested>` cannot collide with what was asked for and reads
+        // correctly in the refusal. An `aud` that is absent — or an array, which
+        // the seam's body can post — has no string to prefix, so it is replaced.
+        Some(Flaw::WrongAud) => {
+            let aud = match claims.get("aud").and_then(Value::as_str) {
+                Some(requested) => format!("wrong-{requested}"),
+                None => flaw::WRONG_AUDIENCE.to_string(),
+            };
+            claims.insert("aud".into(), Value::from(aud));
+        }
+        Some(Flaw::WrongIss) => {
+            claims.insert("iss".into(), Value::from(flaw::WRONG_ISSUER));
+        }
+        // The other three are the header and the signature, and belong to
+        // `jws::sign`. Their claims are exactly what an unflawed request would
+        // have produced, which is why the seam echoes the flaw it was asked for.
+        Some(Flaw::BadSignature) | Some(Flaw::AlgNone) | Some(Flaw::UnknownKid) | None => {}
     }
 
     claims

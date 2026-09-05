@@ -12,6 +12,12 @@
 //!
 //! Dispatch on `grant_type` has exactly one arm today. Phase 4 adds
 //! `authorization_code` as a second arm rather than a second handler.
+//!
+//! Phase 3's `flaw` parameter is parsed here and applied nowhere: it is turned
+//! into a [`Flaw`] and handed to the same one function. The response says
+//! nothing about it — an SDK reading this body should see nothing unusual,
+//! because the whole point is that the token looks ordinary until it is
+//! validated.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -22,6 +28,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::oidc::flaw::Flaw;
 use crate::oidc::issue::{self, DEFAULT_TTL};
 
 pub fn route() -> axum::routing::MethodRouter<SharedState> {
@@ -69,6 +76,18 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
         None => None,
     };
 
+    // A known parameter with an unrecognized value is a refusal, unlike an
+    // unknown parameter, which OAuth says to ignore and this endpoint does:
+    // `flaw=expried` quietly minting a good token is a negative test suite
+    // reporting a pass and proving nothing.
+    let flaw = match form.get("flaw") {
+        Some(raw) => match Flaw::parse(raw) {
+            Ok(flaw) => Some(flaw),
+            Err(message) => return bad_request("invalid_request", message),
+        },
+        None => None,
+    };
+
     let mut overrides = Map::new();
     // `audience` is the Auth0 convention most developers have seen; `resource`
     // is the standards-track one (RFC 8707). Accepting both means a real SDK
@@ -99,12 +118,24 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
         persona,
         &overrides,
         DEFAULT_TTL,
+        flaw,
     ) {
-        Ok((token, _)) => {
+        Ok(issued) => {
+            // The token's actual remaining life, floored at zero, rather than
+            // the TTL it was asked for: `flaw=expired` reporting 60 seconds it
+            // does not have is the one place this envelope could lie. Computed
+            // from the moment `issue` used, because reading the clock a second
+            // time here makes the ordinary case report 59 or 61 at random.
+            let expires_in = issued
+                .claims
+                .get("exp")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_sub(issued.issued_at);
             let mut body = json!({
-                "access_token": token,
+                "access_token": issued.token,
                 "token_type": "Bearer",
-                "expires_in": DEFAULT_TTL,
+                "expires_in": expires_in,
             });
             // Present only when one was asked for. No `id_token`: client
             // credentials has no user authentication event, so returning one

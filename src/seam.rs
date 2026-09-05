@@ -4,8 +4,8 @@
 //! caller rather than as the original home of the claim logic.
 //!
 //! **The body is the claims. The query string is how they are minted.** Phase 3
-//! adds `flaw=alg-none` and friends to the query — the ones that are not
-//! expressible as claims — with no change to the body contract.
+//! added `flaw=alg-none` and friends to the query — including the ones that are
+//! not expressible as claims — with no change to the body contract.
 //!
 //! This endpoint mints a token for any claims anyone asks for, which is exactly
 //! why the default bind is loopback.
@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::oidc::flaw::Flaw;
 use crate::oidc::issue::{self, DEFAULT_TTL};
 
 pub fn routes() -> Router<SharedState> {
@@ -70,13 +71,41 @@ async fn token(
         None => None,
     };
 
+    // An empty `?flaw=` is the shell saying nothing, exactly as `-d flaw=` is on
+    // the grant. The two surfaces have to agree here, or the same spelling is a
+    // `200` on one and a `400` on the other.
+    let flaw = match query.get("flaw").filter(|raw| !raw.is_empty()) {
+        Some(raw) => match Flaw::parse(raw) {
+            Ok(flaw) => Some(flaw),
+            Err(message) => return bad_request("invalid_request", message),
+        },
+        None => None,
+    };
+
     let overrides = match parse_claims(&body) {
         Ok(claims) => claims,
         Err(message) => return bad_request("invalid_request", message),
     };
 
-    match issue::issue(&state.key, &state.config.issuer, persona, &overrides, ttl) {
-        Ok((token, claims)) => Json(json!({ "token": token, "claims": claims })).into_response(),
+    match issue::issue(
+        &state.key,
+        &state.config.issuer,
+        persona,
+        &overrides,
+        ttl,
+        flaw,
+    ) {
+        Ok(issued) => {
+            let mut response = json!({ "token": issued.token, "claims": issued.claims });
+            // Echoed only when one was applied, so an unflawed response is the
+            // Phase 2 shape byte for byte. For the three header-level flaws this
+            // is the only way a fixture can confirm it got what it asked for:
+            // their claims are perfect.
+            if let Some(flaw) = flaw {
+                response["flaw"] = Value::from(flaw.as_str());
+            }
+            Json(response).into_response()
+        }
         Err(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "issuance_failed", "error_description": message })),

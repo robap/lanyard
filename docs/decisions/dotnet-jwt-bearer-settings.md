@@ -104,6 +104,96 @@ It is also the resource-server half of CONCEPT §8's clock-drift discussion: the
 same tolerance that makes a container with a drifting clock work is what makes
 expiry unobservable.
 
+## What .NET says to each of the six deliberate failure tokens
+
+**Phase 3.** Same harness, same build, `ClockSkew = Zero`, `Audience =
+"billing-api"`. Every token below is `lanyard token --as ada --aud billing-api
+--<flag>`; the lines are `spikes/dotnet-api/failure-tokens.sh`'s output and the
+harness's own `OnTokenValidated`/`OnAuthenticationFailed` log, pasted verbatim.
+
+```
+PASS  (good token)     200
+PASS  --expired        401
+PASS  --wrong-aud      401
+PASS  --wrong-iss      401
+PASS  --bad-signature  401
+PASS  --alg-none       401
+PASS  --unknown-kid    200  ← accepted: this RP does not honour kid
+```
+
+```
+TOKEN OK: sub=ada
+TOKEN REFUSED: SecurityTokenExpiredException: IDX10223: Lifetime validation failed. The token is expired. ValidTo (UTC): '9/5/2026 2:16:30 AM', Current time (UTC): '9/5/2026 3:15:30 AM'.
+TOKEN REFUSED: SecurityTokenInvalidAudienceException: IDX10214: Audience validation failed. See https://aka.ms/identitymodel/app-context-switches
+TOKEN REFUSED: SecurityTokenInvalidIssuerException: IDX10205: Issuer validation failed. Issuer: 'https://wrong-issuer.example.test'. Did not match: validationParameters.ValidIssuer: 'null' or validationParameters.ValidIssuers: 'null' or validationParameters.ConfigurationManager.CurrentConfiguration.Issuer: 'http://127.0.0.1:9500/oidc'. For more details, see https://aka.ms/IdentityModel/issuer-validation. 
+TOKEN REFUSED: SecurityTokenInvalidSignatureException: IDX10511: Signature validation failed. Keys tried: 'Microsoft.IdentityModel.Tokens.RsaSecurityKey, KeyId: 'TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU', InternalId: 'TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU'. , KeyId: TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU\n'. 
+TOKEN REFUSED: SecurityTokenInvalidSignatureException: IDX10504: Unable to validate signature, token does not have a signature: '[PII of type 'Microsoft.IdentityModel.Logging.SecurityArtifact' is hidden. For more details, see https://aka.ms/IdentityModel/PII.]'.
+TOKEN OK: sub=ada
+```
+
+The seventh line is `--unknown-kid`, and it says `TOKEN OK`.
+
+| flag | status | exception | the first check that failed |
+|---|---|---|---|
+| *(none)* | `200` | — | none; `TOKEN OK: sub=ada` |
+| `--expired` | `401` | `SecurityTokenExpiredException` | `IDX10223` lifetime |
+| `--wrong-aud` | `401` | `SecurityTokenInvalidAudienceException` | `IDX10214` audience |
+| `--wrong-iss` | `401` | `SecurityTokenInvalidIssuerException` | `IDX10205` issuer |
+| `--bad-signature` | `401` | `SecurityTokenInvalidSignatureException` | `IDX10511` signature |
+| `--alg-none` | `401` | `SecurityTokenInvalidSignatureException` | `IDX10504` no signature at all |
+| `--unknown-kid` | **`200`** | — | **none — accepted** |
+
+**Two flaws share an exception type, and that is recorded rather than tidied
+away.** `--bad-signature` and `--alg-none` are both
+`SecurityTokenInvalidSignatureException`, told apart only by the `IDX` code:
+`IDX10511` is "I tried the key and the bytes did not match", `IDX10504` is
+"there are no bytes to try". `jose` distinguishes them by class
+(`JWSSignatureVerificationFailed` vs `JOSENotSupported`); .NET does not.
+
+### The finding: `AddJwtBearer` accepts a token whose `kid` is in no JWKS
+
+`--unknown-kid` returned **`200`**, and the harness logged `TOKEN OK: sub=ada`.
+`lanyard-unknown-kid` appears nowhere in `/oidc/jwks` — which carries exactly one
+key, `TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU` — and the request finished in
+3.3 ms, so nothing stalled refetching metadata either.
+
+This is not a lanyard bug and not a harness misconfiguration. The signature on
+that token is **real**: it is made by the real key, and only the header's `kid`
+names a key that does not exist. Microsoft.IdentityModel does not require the
+`kid` to resolve — when it does not match, it falls back to trying the keys it
+has, one of which verifies. `jose`, pointed at the same JWKS, refuses the same
+token with `JWKSNoMatchingKey: no applicable key found in the JSON Web Key Set`.
+
+**Two correct-looking libraries disagree about the same token, and that is the
+entire reason the flag exists.** A stack that ignores `kid` cannot detect a
+token signed by a retired or rotated key, because it will keep trying every key
+it holds until one works. If that matters to you, you now know which half of
+your stack you have; if it does not, you know that too. What you cannot do is
+find this out from a provider that only mints good tokens.
+
+Consequences for anyone reading this table:
+
+- `failure-tokens.sh` expects `200` here, with the deviation printed on the line
+  and `UNKNOWN_KID_STATUS=401` available for an RP that does honour `kid`.
+- The spec's acceptance criterion 1 was written expecting six `401`s. It was
+  corrected from this observation rather than the other way round; the token was
+  **not** additionally corrupted to force a refusal, because a token that breaks
+  two things at once tells you nothing about which check ran, and that property
+  is the whole design.
+
+### `--expired` survives .NET's real five minutes
+
+The criterion the hour-long shift exists for. With `CLOCK_SKEW=default dotnet
+run` — the 300 seconds measured above, not this harness's zero:
+
+```
+TOKEN REFUSED: SecurityTokenExpiredException: IDX10223: Lifetime validation failed. The token is expired. ValidTo (UTC): '9/5/2026 2:17:08 AM', Current time (UTC): '9/5/2026 3:16:08 AM'.
+```
+
+`401`, with a good token still `200` seconds later on the same build. A token
+expired by 30 seconds returns `200` here; one expired by an hour does not, which
+is why `--expired` is a fixed one-hour shift and not a tunable.
+
 ## Two smaller observations
 
 - **Audience mismatch is a clean 401.** `lanyard token --as ada --aud not-a-real-api`

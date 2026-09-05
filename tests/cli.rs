@@ -45,6 +45,13 @@ async fn dead_url() -> String {
     format!("http://{addr}")
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 fn payload_of(token: &str) -> serde_json::Value {
     let segment = token.split('.').nth(1).expect("compact JWS");
     serde_json::from_slice(&lanyard_cli::b64::decode(segment).unwrap()).unwrap()
@@ -88,6 +95,7 @@ async fn mint_performs_a_real_grant_and_returns_the_access_token() {
         persona: "ada",
         audience: Some("billing-api"),
         scope: Some("orders:read"),
+        flaw: None,
     })
     .await
     .unwrap();
@@ -110,6 +118,7 @@ async fn nothing_listening_names_the_url_and_the_fix() {
         persona: "ada",
         audience: None,
         scope: None,
+        flaw: None,
     })
     .await
     .unwrap_err();
@@ -132,11 +141,31 @@ async fn a_rejected_grant_surfaces_the_servers_description() {
         persona: "nope",
         audience: None,
         scope: None,
+        flaw: None,
     })
     .await
     .unwrap_err();
 
     assert!(error.to_string().contains("nope"), "{error}");
+}
+
+/// The six flags are one more form field on the grant the CLI already posts —
+/// **the CLI still does not sign.** A local string edit for `--bad-signature`
+/// would be the second signing path this whole phase exists to not have.
+#[tokio::test]
+async fn mint_posts_the_flaw_as_one_more_form_field() {
+    let base = spawn().await;
+    let token = client::mint(&MintRequest {
+        url: &base,
+        persona: "ada",
+        audience: Some("billing-api"),
+        scope: None,
+        flaw: Some("wrong-aud"),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(payload_of(&token)["aud"], "wrong-billing-api");
 }
 
 // ------------------------------------------------------- lanyard token/env --
@@ -330,6 +359,7 @@ async fn a_reply_that_is_not_a_token_names_the_url_and_the_status() {
         persona: "ada",
         audience: None,
         scope: None,
+        flaw: None,
     })
     .await
     .unwrap_err();
@@ -350,9 +380,192 @@ async fn an_https_url_fails_with_a_message_that_still_names_it() {
         persona: "ada",
         audience: None,
         scope: None,
+        flaw: None,
     })
     .await
     .unwrap_err();
 
     assert!(error.to_string().contains(url), "{error}");
+}
+
+// ---------------------------------------------------- the six failure flags --
+
+/// **The CLI still does not sign.** Every flag below is one more form field on
+/// the grant it already posts; a local string edit for `--bad-signature` would
+/// be the second signing path this whole phase exists to not have.
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_prints_a_token_whose_exp_is_already_past() {
+    let base = spawn().await;
+    let output = run(
+        Some(&base),
+        &["token", "--as", "ada", "--aud", "billing-api", "--expired"],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_is_one_bare_token(&stdout(&output));
+
+    let claims = payload_of(stdout(&output).trim());
+    assert!(claims["exp"].as_u64().unwrap() < now(), "{claims}");
+    assert_eq!(claims["sub"], "ada", "only the clock is wrong");
+    assert_eq!(claims["aud"], "billing-api");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_claim_level_flag_damages_exactly_its_own_claim() {
+    let base = spawn().await;
+
+    let wrong_aud = run(
+        Some(&base),
+        &[
+            "token",
+            "--as",
+            "ada",
+            "--aud",
+            "billing-api",
+            "--wrong-aud",
+        ],
+    );
+    let claims = payload_of(stdout(&wrong_aud).trim());
+    assert_eq!(claims["aud"], "wrong-billing-api");
+    assert_eq!(claims["iss"], "http://127.0.0.1:9500/oidc");
+
+    let no_aud = run(Some(&base), &["token", "--as", "ada", "--wrong-aud"]);
+    assert_eq!(payload_of(stdout(&no_aud).trim())["aud"], "wrong-audience");
+
+    let wrong_iss = run(
+        Some(&base),
+        &[
+            "token",
+            "--as",
+            "ada",
+            "--aud",
+            "billing-api",
+            "--wrong-iss",
+        ],
+    );
+    let claims = payload_of(stdout(&wrong_iss).trim());
+    assert_eq!(claims["iss"], "https://wrong-issuer.example.test");
+    assert_eq!(claims["aud"], "billing-api", "only iss is wrong");
+}
+
+/// `--alg-none` is the one token that is not three non-empty segments, so
+/// `assert_is_one_bare_token` deliberately does not apply to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn alg_none_prints_an_unsecured_jwt_with_an_empty_third_segment() {
+    let base = spawn().await;
+    let output = run(
+        Some(&base),
+        &["token", "--as", "ada", "--aud", "billing-api", "--alg-none"],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let line = stdout(&output);
+    let parts: Vec<&str> = line.trim_end().split('.').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[2], "");
+    assert_eq!(
+        String::from_utf8(lanyard_cli::b64::decode(parts[0]).unwrap()).unwrap(),
+        r#"{"alg":"none","typ":"JWT"}"#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_kid_and_bad_signature_come_back_from_the_server() {
+    let base = spawn().await;
+
+    let unknown = run(
+        Some(&base),
+        &[
+            "token",
+            "--as",
+            "ada",
+            "--aud",
+            "billing-api",
+            "--unknown-kid",
+        ],
+    );
+    let header: serde_json::Value = serde_json::from_slice(
+        &lanyard_cli::b64::decode(stdout(&unknown).trim().split('.').next().unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["kid"], "lanyard-unknown-kid");
+    assert_eq!(header["alg"], "RS256");
+
+    let good = run(
+        Some(&base),
+        &["token", "--as", "ada", "--aud", "billing-api"],
+    );
+    let bad = run(
+        Some(&base),
+        &[
+            "token",
+            "--as",
+            "ada",
+            "--aud",
+            "billing-api",
+            "--bad-signature",
+        ],
+    );
+    let good_header = stdout(&good);
+    let bad_header = stdout(&bad);
+    assert_eq!(
+        bad_header.trim().split('.').next().unwrap(),
+        good_header.trim().split('.').next().unwrap(),
+        "byte-identical header, so the failure lands on the signature"
+    );
+    assert_eq!(payload_of(bad_header.trim())["sub"], "ada");
+}
+
+/// One flaw per token: a resource server reports only the first check it fails,
+/// so two flags at once tests strictly less than either alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_flaws_at_once_is_a_usage_error_naming_both() {
+    let base = spawn().await;
+    let output = run(
+        Some(&base),
+        &["token", "--as", "ada", "--expired", "--wrong-aud"],
+    );
+
+    assert!(!output.status.success());
+    assert_eq!(output.stdout.len(), 0, "nothing may reach a header");
+    let message = stderr(&output);
+    assert!(message.contains("--expired"), "{message}");
+    assert!(message.contains("--wrong-aud"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn env_takes_the_flags_too() {
+    let base = spawn().await;
+    let output = run(
+        Some(&base),
+        &["env", "--as", "ada", "--aud", "billing-api", "--expired"],
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let line = stdout(&output);
+    let token = line
+        .strip_prefix("export BEARER_TOKEN='")
+        .and_then(|rest| rest.strip_suffix("'\n"))
+        .unwrap_or_else(|| panic!("not a single-quoted export line: {line:?}"));
+    assert!(payload_of(token)["exp"].as_u64().unwrap() < now());
+}
+
+#[test]
+fn both_help_screens_list_all_six_flags() {
+    for subcommand in ["token", "env"] {
+        let help = stdout(&run(None, &[subcommand, "--help"]));
+        for flag in [
+            "--expired",
+            "--wrong-aud",
+            "--wrong-iss",
+            "--bad-signature",
+            "--alg-none",
+            "--unknown-kid",
+        ] {
+            assert!(
+                help.contains(flag),
+                "`lanyard {subcommand} --help` omits {flag}:\n{help}"
+            );
+        }
+    }
 }

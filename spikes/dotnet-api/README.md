@@ -20,6 +20,12 @@ curl -s -o /dev/null -w '%{http_code}\n' \
   http://127.0.0.1:5080/orders
 ```
 
+`./failure-tokens.sh` is the Phase 3 negative-path suite against this same
+`/orders`: one good token and the six deliberate failures, one `PASS`/`FAIL`
+line each, exit `0` only when all seven match. It reads `LANYARD`, `API`,
+`PERSONA` and `AUD` from the environment, so a `lanyard` that is not on `PATH`
+is `LANYARD=../../target/debug/lanyard ./failure-tokens.sh`.
+
 Two knobs, both in the subtraction style of the Phase 0 spike:
 
 - **`DROP=Name,Name`** omits an `AddJwtBearer` setting so its absence can be

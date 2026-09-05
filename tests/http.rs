@@ -59,6 +59,13 @@ async fn post_token(base: &str, query: &str, body: &str) -> (u16, serde_json::Va
 
 const ISSUER: &str = "http://127.0.0.1:9500/oidc";
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[tokio::test]
 async fn root_is_left_free() {
     let base = spawn().await;
@@ -693,6 +700,255 @@ async fn the_token_endpoint_is_post_only() {
     assert_eq!(res.status().as_u16(), 405);
 }
 
+// ------------------------------------------------------ the grant's `flaw` --
+
+/// `expires_in` is the token's actual remaining life, floored at zero, so
+/// `flaw=expired` reports `0` rather than claiming 60 seconds it does not have.
+/// No new field: an SDK reading this response should see nothing unusual,
+/// because the whole point is that the token looks ordinary until it is
+/// validated.
+#[tokio::test]
+async fn an_expired_grant_reports_no_remaining_life_and_no_flaw() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("audience", "billing-api"),
+            ("flaw", "expired"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["expires_in"], 0, "it has no life left to report");
+
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["access_token", "expires_in", "token_type"],
+        "the OAuth envelope stays exactly the shape an SDK expects"
+    );
+
+    let claims = payload_of(body["access_token"].as_str().unwrap());
+    assert!(claims["exp"].as_u64().unwrap() < now(), "{claims}");
+    assert_eq!(claims["aud"], "billing-api", "only the clock is wrong");
+}
+
+/// The three that are not claims reach the grant too — the CLI's
+/// `--bad-signature` is this request, not a local string edit.
+#[tokio::test]
+async fn the_header_level_flaws_reach_the_grant() {
+    let base = spawn().await;
+
+    let (_, _, unsigned) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("flaw", "alg-none"),
+        ],
+    )
+    .await;
+    let token = unsigned["access_token"].as_str().unwrap();
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[2], "");
+    assert_eq!(
+        String::from_utf8(lanyard_cli::b64::decode(parts[0]).unwrap()).unwrap(),
+        r#"{"alg":"none","typ":"JWT"}"#
+    );
+
+    let (_, _, wrong_key) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("flaw", "unknown-kid"),
+        ],
+    )
+    .await;
+    let header: serde_json::Value = serde_json::from_slice(
+        &lanyard_cli::b64::decode(
+            wrong_key["access_token"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .next()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["kid"], "lanyard-unknown-kid");
+    assert_eq!(header["alg"], "RS256");
+}
+
+#[tokio::test]
+async fn an_unknown_flaw_on_the_grant_is_a_400_naming_it_and_all_six() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("flaw", "expried"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "invalid_request");
+    let description = body["error_description"].as_str().unwrap();
+    assert!(description.contains("expried"), "{description}");
+    for name in [
+        "expired",
+        "wrong-aud",
+        "wrong-iss",
+        "bad-signature",
+        "alg-none",
+        "unknown-kid",
+    ] {
+        assert!(description.contains(name), "{name} missing: {description}");
+    }
+    assert!(
+        body.as_object().unwrap().get("access_token").is_none(),
+        "a typo must not mint anything"
+    );
+
+    // Still serving.
+    let (status, _, _) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+/// `-d flaw=` is the shell saying nothing, exactly as `-d scope=` is.
+#[tokio::test]
+async fn an_empty_flaw_reads_as_absent_on_the_grant() {
+    let base = spawn().await;
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "ada"),
+            ("flaw", ""),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["expires_in"], 60);
+}
+
+// ------------------------------------------------------- the seam's `flaw` --
+
+/// The seam is a fixture, so it echoes what it was asked for. For the three
+/// header-level flaws that echo is the only way a fixture can tell it got the
+/// token it asked for, because their claims are perfect.
+#[tokio::test]
+async fn the_seam_applies_a_flaw_and_echoes_it() {
+    let base = spawn().await;
+    let (status, body) = post_token(
+        &base,
+        "?persona=ada&flaw=wrong-aud",
+        r#"{"aud":"billing-api"}"#,
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["flaw"], "wrong-aud");
+    assert_eq!(body["claims"]["aud"], "wrong-billing-api");
+    assert_eq!(
+        payload_of(body["token"].as_str().unwrap()),
+        body["claims"],
+        "the seam's contract is that `claims` is what was signed"
+    );
+}
+
+/// `claims` shows the damage for the claim-level flaws, and is untouched for the
+/// header-level ones — exactly true in both cases.
+#[tokio::test]
+async fn the_seam_reports_the_damage_it_did_and_no_more() {
+    let base = spawn().await;
+
+    let (_, expired) = post_token(&base, "?persona=ada&flaw=expired", "").await;
+    let claims = &expired["claims"];
+    assert_eq!(
+        claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
+        60,
+        "the lifetime survives the shift"
+    );
+    assert!(claims["exp"].as_u64().unwrap() < now(), "{claims}");
+
+    let (_, unsigned) = post_token(&base, "?persona=ada&flaw=alg-none", "").await;
+    assert_eq!(unsigned["flaw"], "alg-none");
+    assert_eq!(
+        unsigned["claims"]["iss"], ISSUER,
+        "a header-level flaw leaves the claims correct"
+    );
+}
+
+#[tokio::test]
+async fn no_flaw_means_no_flaw_field_at_all() {
+    let base = spawn().await;
+    let (_, body) = post_token(&base, "?persona=ada", "").await;
+    assert!(
+        body.as_object().unwrap().get("flaw").is_none(),
+        "an unflawed response must look exactly as it did in Phase 2: {body}"
+    );
+}
+
+/// A known parameter with an unrecognized value is a refusal, not an ignored
+/// parameter: a typo that quietly mints a good token is a negative test suite
+/// reporting six passes and proving nothing.
+#[tokio::test]
+async fn an_unknown_flaw_on_the_seam_is_a_400_naming_it_and_all_six() {
+    let base = spawn().await;
+    let (status, body) = post_token(&base, "?persona=ada&flaw=expried", "").await;
+
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "invalid_request");
+    let description = body["error_description"].as_str().unwrap();
+    assert!(description.contains("expried"), "{description}");
+    for name in [
+        "expired",
+        "wrong-aud",
+        "wrong-iss",
+        "bad-signature",
+        "alg-none",
+        "unknown-kid",
+    ] {
+        assert!(description.contains(name), "{name} missing: {description}");
+    }
+    assert!(body.as_object().unwrap().get("token").is_none());
+
+    // Still serving.
+    let (status, _) = post_token(&base, "?persona=ada", "").await;
+    assert_eq!(status, 200);
+}
+
+/// `?flaw=` is the shell saying nothing, and the grant's `Form::get` already
+/// reads an empty value as absent. The two surfaces have to agree, or the same
+/// spelling is a `200` on one and a `400` on the other.
+#[tokio::test]
+async fn an_empty_flaw_reads_as_absent_on_the_seam() {
+    let base = spawn().await;
+    let (status, body) = post_token(&base, "?persona=ada&flaw=", "").await;
+
+    assert_eq!(status, 200, "{body}");
+    assert!(body.as_object().unwrap().get("flaw").is_none());
+}
+
 // ------------------------------------------------ one function, observable --
 
 /// **North star 3, finally falsifiable.** Phase 1 shipped `issue()` with a
@@ -734,4 +990,107 @@ async fn the_seam_and_the_grant_produce_the_same_claims() {
     assert_eq!(through_the_grant["sub"], "ada");
     assert_eq!(through_the_grant["aud"], "billing-api");
     assert_eq!(through_the_grant["email"], "ada@example.test");
+}
+
+/// **North star 3 with the flaws included.** A flaw that is applied in
+/// `oidc::token` rather than in the one function would show up here as a diff:
+/// two callers, one claim set.
+#[tokio::test]
+async fn the_two_surfaces_agree_under_a_flaw_too() {
+    let base = spawn().await;
+
+    for flaw in ["wrong-iss", "wrong-aud"] {
+        let (_, seam) = post_token(
+            &base,
+            &format!("?persona=ada&flaw={flaw}"),
+            r#"{"aud":"billing-api"}"#,
+        )
+        .await;
+        let (_, _, grant) = post_grant(
+            &base,
+            &[
+                ("grant_type", "client_credentials"),
+                ("persona", "ada"),
+                ("audience", "billing-api"),
+                ("flaw", flaw),
+            ],
+        )
+        .await;
+
+        let mut through_the_seam = seam["claims"].as_object().unwrap().clone();
+        let mut through_the_grant = payload_of(grant["access_token"].as_str().unwrap())
+            .as_object()
+            .unwrap()
+            .clone();
+        for per_request in ["iat", "nbf", "exp", "jti", "client_id"] {
+            through_the_seam.remove(per_request);
+            through_the_grant.remove(per_request);
+        }
+
+        assert_eq!(through_the_seam, through_the_grant, "for flaw={flaw}");
+        // Guard against the test passing because the flaw did nothing.
+        match flaw {
+            "wrong-iss" => {
+                assert_eq!(
+                    through_the_grant["iss"],
+                    "https://wrong-issuer.example.test"
+                )
+            }
+            _ => assert_eq!(through_the_grant["aud"], "wrong-billing-api"),
+        }
+    }
+}
+
+/// Flaws mint; they do not mutate. Nothing about producing a broken token
+/// touches server state — least of all the key an RP has already cached.
+#[tokio::test]
+async fn the_jwks_is_unchanged_after_minting_every_flaw() {
+    let base = spawn().await;
+
+    let before: serde_json::Value = reqwest::get(format!("{base}/oidc/jwks"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    for flaw in [
+        "expired",
+        "wrong-aud",
+        "wrong-iss",
+        "bad-signature",
+        "alg-none",
+        "unknown-kid",
+    ] {
+        let (status, _, _) = post_grant(
+            &base,
+            &[
+                ("grant_type", "client_credentials"),
+                ("persona", "ada"),
+                ("audience", "billing-api"),
+                ("flaw", flaw),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200, "{flaw} did not mint");
+        let (status, _) = post_token(&base, &format!("?persona=ada&flaw={flaw}"), "").await;
+        assert_eq!(status, 200, "{flaw} did not mint on the seam");
+    }
+
+    let after: serde_json::Value = reqwest::get(format!("{base}/oidc/jwks"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(after, before);
+    assert_eq!(after["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after["keys"][0]["kid"], "TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU",
+        "the unknown kid must never reach the JWKS"
+    );
+    assert!(!serde_json::to_string(&after)
+        .unwrap()
+        .contains("lanyard-unknown-kid"));
 }
