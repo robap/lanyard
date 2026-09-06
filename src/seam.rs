@@ -72,9 +72,13 @@ async fn token(
         None => DEFAULT_TTL,
     };
 
+    // Absent behaves as a `client_id` nobody scoped to — the unscoped set — for
+    // the reason the visibility rule gives: a request with no `client_id` sees
+    // exactly what an unrecognised one sees.
+    let people = state.personas.resolve();
     let persona = match query.get("persona") {
-        Some(id) => match state.personas.get(id) {
-            Some(p) => Some(p),
+        Some(id) => match people.get(id, query.get("client_id").map(String::as_str)) {
+            Some(p) => Some(&p.persona),
             None => {
                 return bad_request(
                     "unknown_persona",
@@ -183,12 +187,40 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
-/// The JSON seam the Phase 4 picker will read, and the only way to observe that
-/// persona loading works at all in this phase. Both `client:` levels are echoed
-/// untouched; nothing filters on them until Phase 7.
-async fn personas(State(state): State<SharedState>) -> impl IntoResponse {
-    Json(json!({
-        "client": state.personas.client,
-        "personas": state.personas.list,
-    }))
+/// The JSON seam the picker reads, and the surface a test asserts the
+/// visibility rule on without scraping HTML.
+///
+/// **With `client_id`, the visible set; without it, everything** — every
+/// persona from every source, each row carrying the `client:` that actually
+/// applies to it and the file it came from. The unfiltered form is the
+/// debugging view, and it is the one a developer reaches for when the filtered
+/// one surprised them.
+async fn personas(
+    State(state): State<SharedState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let people = state.personas.resolve();
+    let rows: Vec<Value> = match query.get("client_id") {
+        Some(client_id) => people
+            .visible_to(Some(client_id))
+            .into_iter()
+            .map(row)
+            .collect(),
+        None => people.all().iter().map(row).collect(),
+    };
+    Json(json!({ "personas": rows, "warnings": people.warnings }))
+}
+
+/// A persona, plus the two things it does not carry itself: the **effective**
+/// `client:` and the source it came from.
+fn row(sourced: &crate::registry::Sourced) -> Value {
+    let mut value = serde_json::to_value(&sourced.persona).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        match &sourced.client {
+            Some(client) => object.insert("client".into(), Value::from(client.clone())),
+            None => object.remove("client"),
+        };
+        object.insert("source".into(), Value::from(sourced.source()));
+    }
+    value
 }

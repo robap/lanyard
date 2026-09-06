@@ -76,6 +76,7 @@ pub async fn layer(State(state): State<SharedState>, request: Request, next: Nex
         detail: detail.detail,
         issued: detail.issued,
         flaw: detail.flaw,
+        warnings: detail.warnings,
     });
 
     // stdout is the durable surface: `lanyard serve > lanyard.log` is the whole

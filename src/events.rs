@@ -59,6 +59,11 @@ pub struct Event {
     /// The decoded header and payload of every token minted.
     pub issued: Option<Map<String, Value>>,
     pub flaw: Option<String>,
+    /// Warnings about the persona sources, as of this request. Skipped when
+    /// there are none, so `lanyard logs --json | jq 'select(.warnings)'` is the
+    /// filter for "when did that project file break".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 /// What travels on the broadcast channel: a newly recorded [`Event`], or a
@@ -91,6 +96,7 @@ pub struct EventDraft {
     pub detail: Option<Map<String, Value>>,
     pub issued: Option<Map<String, Value>>,
     pub flaw: Option<String>,
+    pub warnings: Option<Vec<String>>,
 }
 
 /// Events retained for replay.
@@ -149,6 +155,7 @@ impl EventBus {
             detail: draft.detail,
             issued: draft.issued,
             flaw: draft.flaw,
+            warnings: draft.warnings,
         };
         let mut ring = self.inner.ring.lock().expect("event ring poisoned");
         if ring.len() == self.inner.capacity {
@@ -272,6 +279,13 @@ fn tail(e: &Event) -> String {
 
     if let Some(flaw) = &e.flaw {
         parts.push(format!("flaw={flaw}"));
+    }
+    // **Last, and always** — on a success and on a failure alike. It is not
+    // what this request did; it is what is wrong with the persona sources while
+    // it was being answered, and the developer who is about to wonder where
+    // somebody went is reading this line.
+    for warning in e.warnings.iter().flatten() {
+        parts.push(format!("warning: {warning}"));
     }
     parts.join("  ")
 }

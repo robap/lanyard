@@ -24,6 +24,22 @@ impl PersonasSource {
     }
 }
 
+/// Where the links registry lives.
+///
+/// **No explicit/default split, unlike [`PersonasSource`]**: an absent registry
+/// is the zero-config state whichever way its path was chosen. Pointing
+/// `LANYARD_PERSONAS` at a file that is not there leaves you with an empty
+/// picker, which is why that case is fatal; having no links is the normal
+/// condition of a fresh machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinksSource(pub PathBuf);
+
+impl LinksSource {
+    pub fn path(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub issuer: String,
@@ -31,6 +47,7 @@ pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
     pub personas: PersonasSource,
+    pub links: LinksSource,
 }
 
 impl Config {
@@ -73,12 +90,24 @@ impl Config {
             ),
         };
 
+        // Beside `users.yaml`, which is the other file that answers "where do
+        // personas come from".
+        let links = match get("LANYARD_LINKS") {
+            Some(raw) => LinksSource(PathBuf::from(raw)),
+            None => LinksSource(
+                base_dir(&get, "XDG_CONFIG_HOME", ".config")?
+                    .join("lanyard")
+                    .join("links.yaml"),
+            ),
+        };
+
         Ok(Config {
             issuer,
             bind,
             port,
             data_dir,
             personas,
+            links,
         })
     }
 
@@ -253,6 +282,11 @@ mod tests {
             c.personas.path(),
             &PathBuf::from("/home/dev/.config/lanyard/users.yaml")
         );
+        assert_eq!(
+            c.links.path(),
+            &PathBuf::from("/home/dev/.config/lanyard/links.yaml"),
+            "the links registry sits beside users.yaml, not in the data directory"
+        );
 
         let c = Config::resolve(env(&[
             ("HOME", "/home/dev"),
@@ -265,6 +299,10 @@ mod tests {
             c.personas.path(),
             &PathBuf::from("/xdg/config/lanyard/users.yaml")
         );
+        assert_eq!(
+            c.links.path(),
+            &PathBuf::from("/xdg/config/lanyard/links.yaml")
+        );
     }
 
     #[test]
@@ -273,6 +311,7 @@ mod tests {
             ("HOME", "/home/dev"),
             ("LANYARD_DATA_DIR", "/tmp/throwaway"),
             ("LANYARD_PERSONAS", "/tmp/users.yaml"),
+            ("LANYARD_LINKS", "/tmp/links.yaml"),
         ]))
         .unwrap();
         assert_eq!(c.data_dir, PathBuf::from("/tmp/throwaway"));
@@ -280,6 +319,7 @@ mod tests {
             c.personas,
             PersonasSource::Explicit(PathBuf::from("/tmp/users.yaml"))
         );
+        assert_eq!(c.links, LinksSource(PathBuf::from("/tmp/links.yaml")));
     }
 
     #[test]

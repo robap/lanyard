@@ -1,0 +1,28 @@
+# The personas this project needs, committed beside its code.
+#
+# `client:` at the file level scopes every one of them to `billing-web` — the
+# `client_id` this app sends, invented in `Program.cs` and registered with
+# nobody. The effect is on the *picker*: starting a login from this app lists
+# these three and not php-web's `qa-bot`. It is not a registration and it
+# refuses nothing.
+client: billing-web
+
+personas:
+  - id: dev-admin
+    name: Dev Admin
+    email: dev-admin@billing.test
+    roles: [admin, billing:write]
+
+  - id: billing-readonly
+    name: Billing Read-Only
+    email: readonly@billing.test
+    roles: [billing:read]
+
+  # The account that is real, has a name, and must not get in. What your app
+  # does with it is the question this persona asks.
+  - id: locked-out
+    name: Locked Out
+    email: locked-out@billing.test
+    roles: []
+    attributes:
+      account_status: locked

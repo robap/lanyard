@@ -24,9 +24,14 @@ pub struct Persona {
     /// makes rejecting unknown keys cost nobody anything.
     #[serde(default)]
     pub attributes: Map<String, Value>,
-    /// Parsed, validated, echoed back — and read by nothing until Phase 7.
-    /// Carrying it from day one is what turns Phase 7 into an addition rather
-    /// than a migration (CONCEPT §15).
+    /// **Which application this persona belongs to.** Read by
+    /// [`crate::registry::Sourced::visible_to`] and nowhere else: a persona that
+    /// declares one is on that `client_id`'s picker and on nobody else's.
+    ///
+    /// Carried in the schema since Phase 1 and read from Phase 7, which is what
+    /// made namespacing an addition rather than a migration (CONCEPT §15). It is
+    /// a label a persona wears, never a record lanyard keeps — nothing is
+    /// refused for naming a `client_id` no persona mentions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
 }
@@ -35,7 +40,10 @@ pub struct Persona {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Origin {
     BuiltIn,
+    /// The global `users.yaml`, which replaces the built-ins entirely.
     File(PathBuf),
+    /// A linked project's `lanyard.yaml`, which adds and never subtracts.
+    Project(PathBuf),
 }
 
 #[derive(Debug, Clone)]

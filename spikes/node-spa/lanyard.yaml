@@ -1,0 +1,12 @@
+# **No `client:` — deliberately.**
+#
+# Namespacing is opt-in. A project that ships personas without scoping them gets
+# travelling personas that work everywhere: `kiosk` is on billing-web's picker,
+# on spike-php's, on this app's, and reachable from `lanyard token --as kiosk`
+# with no `--client` at all. Most projects should start here and reach for
+# `client:` only when their picker gets crowded.
+personas:
+  - id: kiosk
+    name: Kiosk User
+    email: kiosk@spa.test
+    roles: [kiosk]

@@ -25,6 +25,7 @@ use crate::oidc::authorize;
 use crate::oidc::revocation;
 use crate::oidc::token::Form;
 use crate::persona::Persona;
+use crate::registry::{Resolved, Sourced};
 use crate::session;
 use crate::store::{Lookup, Selection};
 
@@ -55,6 +56,10 @@ pub async fn picker(
     let form = Form::from_query(query.as_deref().unwrap_or_default());
     let browser = Browser::of(&state, session::from_headers(&headers).as_deref());
 
+    // **The unfiltered view, without abandoning the login.** `Show all` on a
+    // filtered picker sets this; the request stays pending and the people this
+    // application can see stay pickable.
+    let show_all = form.get("all").is_some();
     let req = form.get("req");
     let pending = req.map(|id| {
         let store = state.stores.pending.lock().expect("pending");
@@ -78,7 +83,7 @@ pub async fn picker(
                      <p>An authorization request is held for five minutes, and lanyard \
                      holds them in memory, so either the five minutes ran out or lanyard \
                      was restarted. Start the login again from your application.</p>\n</div>\n{}",
-                    persona_list(&state, None, &browser)
+                    persona_list(&state, None, false, &browser)
                 ),
             ),
         ),
@@ -86,22 +91,35 @@ pub async fn picker(
             StatusCode::OK,
             html::page(
                 "lanyard — pick a person",
-                &persona_list(&state, Some((id, &client_id)), &browser),
+                &persona_list(&state, Some((id, &client_id)), show_all, &browser),
             ),
         ),
         // The banner's `UI →` line lands here, so it has to be honest about
         // there being nothing to do.
         _ => html::html(
             StatusCode::OK,
-            html::page("lanyard — personas", &persona_list(&state, None, &browser)),
+            html::page(
+                "lanyard — personas",
+                &persona_list(&state, None, false, &browser),
+            ),
         ),
     }
 }
 
 /// The list of people, as buttons when a login is waiting on one and as plain
 /// cards when nothing is.
-fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browser) -> String {
-    let mut out = String::new();
+fn persona_list(
+    state: &SharedState,
+    req: Option<(&str, &str)>,
+    show_all: bool,
+    browser: &Browser,
+) -> String {
+    // **Resolved once per page**, and every lookup on it reads the same
+    // snapshot: a picker whose list and whose "this browser" rows disagreed
+    // because a file changed between them would be lanyard contradicting itself
+    // half way down one page.
+    let people = state.personas.resolve();
+    let mut out = warning_band(&people);
 
     match req {
         Some((_, client_id)) => out.push_str(&format!(
@@ -117,12 +135,40 @@ fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browse
         ),
     }
 
-    for persona in &state.personas.list {
-        out.push_str(&persona_row(persona, req.map(|(id, _)| id)));
+    // **Filtered during a login, unfiltered otherwise.** The clean-picker-per-
+    // project property is half of why the phase exists, and with no login in
+    // progress there is no `client_id` to filter by — that view is the
+    // debugging one, and it lists everybody with its labels on.
+    let client_id = req.map(|(_, client_id)| client_id);
+    let visible = people.visible_to(client_id);
+    let labelled = show_all || req.is_none();
+    let listed: Vec<&Sourced> = if labelled {
+        people.all().iter().collect()
+    } else {
+        visible.clone()
+    };
+
+    for sourced in &listed {
+        // A person this application cannot see is a **card, never a button**:
+        // the rule filters a list and never gates a grant, but offering a
+        // button whose `POST` this same rule would refuse is a promise the
+        // next page breaks.
+        let pickable = req
+            .map(|(id, _)| id)
+            .filter(|_| visible.iter().any(|one| one.id() == sourced.id()));
+        out.push_str(&persona_row(sourced, pickable, labelled));
+    }
+
+    if let Some((req_id, _)) = req {
+        out.push_str(&hidden_line(
+            req_id,
+            show_all,
+            people.all().len() - visible.len(),
+        ));
     }
 
     out.push_str(&mint_panel(req.map(|(id, _)| id)));
-    out.push_str(&this_browser_panel(state, req.map(|(id, _)| id), browser));
+    out.push_str(&this_browser_panel(&people, req.map(|(id, _)| id), browser));
     out.push_str(
         "<footer class=\"text-small\">lanyard · sessions live in memory, so restarting \
          lanyard logs everybody out. · <a href=\"/_/log\">live log</a></footer>\n",
@@ -130,7 +176,63 @@ fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browse
     out
 }
 
-fn persona_row(persona: &Persona, req: Option<&str>) -> String {
+/// **A band at the top of the page**, naming the path and the error.
+///
+/// One of the three surfaces Phase 7's warnings reach from one source — the
+/// other two are the startup banner and the event stream — and this is the one
+/// that matters most, because the picker is where a missing person is noticed.
+///
+/// Everything in it is escaped. The surface grew in Phase 7 to include file
+/// paths and client labels that came out of a repository somebody cloned; the
+/// rule that they go through `html::escape` did not change.
+fn warning_band(people: &Resolved) -> String {
+    if people.warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<div class=\"warn card stack gap-sm pad-md border\">\n\
+         <h2 class=\"text-eyebrow\">Some personas could not be loaded</h2>\n",
+    );
+    for warning in &people.warnings {
+        out.push_str(&format!(
+            "<p class=\"text-small\">{}</p>\n",
+            html::escape(&warning.to_string())
+        ));
+    }
+    out.push_str(
+        "<p class=\"lede text-small\">Every other source still loaded. <code>lanyard links</code> lists every linked project and its state.</p>\n</div>\n",
+    );
+    out
+}
+
+/// **What the filtered picker hid**, and the way back to it.
+///
+/// Filtering silently would recreate "why is Ada not there" one layer down, so
+/// the page says the number and offers the full list — without abandoning the
+/// login, which is the whole reason the link carries the `req` rather than
+/// dropping it.
+fn hidden_line(req: &str, show_all: bool, hidden: usize) -> String {
+    if show_all {
+        return format!(
+            "<p class=\"lede text-small\">Showing every persona from every source. <a href=\"/_/?req={}\">Show only this application's people</a></p>\n",
+            html::escape(req)
+        );
+    }
+    if hidden == 0 {
+        return String::new();
+    }
+    format!(
+        "<p class=\"lede text-small\">{hidden} other persona{} scoped to other applications. <a href=\"/_/?req={}&amp;all=1\">Show all</a></p>\n",
+        if hidden == 1 { " is" } else { "s are" },
+        html::escape(req),
+    )
+}
+
+/// One person. `req` is `Some` only when this row can actually be picked, and
+/// `labelled` adds the two things the debugging view exists to show: the client
+/// the persona is scoped to and the file it came from.
+fn persona_row(sourced: &Sourced, req: Option<&str>, labelled: bool) -> String {
+    let persona = &sourced.persona;
     // Every one of these is developer-supplied and every one of them is
     // escaped. A persona file can come out of a fixture generator, and a picker
     // that executes its own persona list is a bad look for a tool whose pitch
@@ -154,8 +256,24 @@ fn persona_row(persona: &Persona, req: Option<&str>) -> String {
             html::escape(&persona.roles.join(", "))
         )
     };
+    // A `client:` and a file path are developer-supplied strings out of a
+    // repository somebody cloned, and they go through the same escaping every
+    // other string on this page does.
+    let label = if labelled {
+        format!(
+            "<span class=\"client text-small\">{}</span>\n\
+             <span class=\"source text-code text-small\">{}</span>\n",
+            match &sourced.client {
+                Some(client) => html::escape(client),
+                None => "every application".to_string(),
+            },
+            html::escape(&sourced.source()),
+        )
+    } else {
+        String::new()
+    };
     let inner = format!(
-        "{name}\n<span class=\"id text-code text-small\">{}</span>\n{email}\n{roles}\n",
+        "{name}\n<span class=\"id text-code text-small\">{}</span>\n{email}\n{roles}\n{label}",
         html::escape(&persona.id)
     );
 
@@ -240,7 +358,7 @@ impl Browser {
 /// On both versions of the page — with a login in progress and without — because
 /// the question "who does this browser think I am" is the one a developer opens
 /// this page to answer, and a login in progress is not a reason to hide it.
-fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser) -> String {
+fn this_browser_panel(people: &Resolved, req: Option<&str>, browser: &Browser) -> String {
     let mut out = String::from("<h2 class=\"text-eyebrow\">This browser</h2>\n");
 
     if browser.signed_in.is_empty() {
@@ -250,7 +368,7 @@ fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser)
         );
     }
     for (client_id, selection) in &browser.signed_in {
-        out.push_str(&signed_in_row(state, req, client_id, selection));
+        out.push_str(&signed_in_row(people, req, client_id, selection));
     }
 
     // **Log out of lanyard**: the whole session, every selection and every
@@ -292,15 +410,17 @@ fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser)
 /// named by its id rather than dropped — the selection is real even when the
 /// file it came from changed underneath it.
 fn signed_in_row(
-    state: &SharedState,
+    people: &Resolved,
     req: Option<&str>,
     client_id: &str,
     selection: &Selection,
 ) -> String {
-    let who = match state.personas.get(&selection.persona_id) {
-        Some(persona) => match &persona.name {
+    // Scoped by the row's own `client_id`: this row is about one application,
+    // and the person it names has to be the one that application would get.
+    let who = match people.get(&selection.persona_id, Some(client_id)) {
+        Some(sourced) => match &sourced.persona.name {
             Some(name) => html::escape(name),
-            None => html::escape(&persona.id),
+            None => html::escape(&sourced.persona.id),
         },
         None => format!(
             "{} <span class=\"none\">(no longer in the persona list)</span>",
@@ -393,8 +513,13 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
     // the same thing — which is what makes "mint one now" a feature rather than
     // a second code path (spec, open question 10).
     let (persona, remember) = match form.get("persona") {
-        Some(id) => match state.personas.get(id) {
-            Some(persona) => (persona.clone(), true),
+        Some(id) => match state
+            .personas
+            .resolve()
+            .get(id, Some(&request.client_id))
+            .map(|sourced| sourced.persona.clone())
+        {
+            Some(persona) => (persona, true),
             None => {
                 return html::html(
                     StatusCode::BAD_REQUEST,
@@ -506,7 +631,7 @@ fn expired_page(state: &SharedState, browser: &Browser) -> Response {
                  <p>The request was already answered, or its five minutes ran out, or \
                  lanyard was restarted. Start the login again from your \
                  application.</p>\n</div>\n{}",
-                persona_list(state, None, browser)
+                persona_list(state, None, false, browser)
             ),
         ),
     )

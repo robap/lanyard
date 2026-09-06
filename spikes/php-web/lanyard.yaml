@@ -1,0 +1,9 @@
+# Scoped to this app's own `client_id`, which is where the second half of the
+# demo comes from: two projects linked at once, two different pickers.
+client: spike-php
+
+personas:
+  - id: qa-bot
+    name: QA Bot
+    email: qa-bot@php.test
+    roles: [qa]

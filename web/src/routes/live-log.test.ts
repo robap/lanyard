@@ -429,6 +429,68 @@ describe("LiveLog", () => {
     expect(text(el, ".request-json")).toContain('"openid"');
   });
 
+  // A warning is not what this request did — it is the state of the persona
+  // sources it was answered in. `/_/` emits no event, so a broken project file
+  // reaches this page on the next protocol request.
+  it("puts a source warning on the row that carried it", async () => {
+    const el = render(LiveLog());
+    emit({ warnings: ["/code/billing: linked directory does not exist"] });
+    await flushFrames();
+    const cell = find(el, "td.c-detail")!.textContent ?? "";
+    expect(cell).toContain("warning");
+    expect(cell).toContain("/code/billing");
+  });
+
+  // A warning rides on a refusal too — it is not what the request did, so a
+  // failure does not displace it — and the two are separated on the one line.
+  it("keeps the refusal and the warning apart on a failed row", async () => {
+    const el = render(LiveLog());
+    emit({
+      error: "invalid_grant",
+      error_description: "no such code",
+      warnings: ["/code/billing: linked directory does not exist"],
+    });
+    await flushFrames();
+    expect(find(el, "td.c-detail")!.textContent ?? "").toContain(
+      "invalid_grant — no such code  warning: /code/billing",
+    );
+  });
+
+  it("shows a single warning in the expanded panel", async () => {
+    const el = render(LiveLog());
+    emit({ warnings: ["/code/billing: linked directory does not exist"] });
+    await flushFrames();
+    fire(find(el, ".log-row")!, "click");
+    await flushFrames();
+    expect(findAll(el, ".warning-line").length).toBe(1);
+  });
+
+  it("shows every warning in the expanded panel", async () => {
+    const el = render(LiveLog());
+    emit({
+      warnings: [
+        "/code/billing: linked directory does not exist",
+        'persona "ada" is defined in A and B; A wins',
+      ],
+    });
+    await flushFrames();
+    fire(find(el, ".log-row")!, "click");
+    await flushFrames();
+    const lines = findAll(el, ".warning-line").map((w) => w.textContent);
+    expect(lines.length).toBe(2);
+    expect(lines[1]).toContain("A wins");
+  });
+
+  it("renders no warning panel when the sources are healthy", async () => {
+    const el = render(LiveLog());
+    emit({});
+    await flushFrames();
+    fire(find(el, ".log-row")!, "click");
+    await flushFrames();
+    expect(findAll(el, ".warning-line").length).toBe(0);
+    expect(find(el, "td.c-detail")!.textContent ?? "").not.toContain("warning");
+  });
+
   it("ignores a frame that is not an event", async () => {
     const el = render(LiveLog());
     emitFrame("not json");

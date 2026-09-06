@@ -122,12 +122,26 @@ fn logged(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
         .or_insert_with(|| serde_json::Value::from(mode_of(&form)));
 
     let client_id = form.get("client_id").map(str::to_string);
+
+    // **Resolved unconditionally, and here rather than deeper in.** `/authorize`
+    // is the request that decides whether the picker is needed, so it is the
+    // request a warning about the persona sources has to ride back on — and it
+    // must do so whether or not this login ever looked a persona up.
+    let warnings: Vec<String> = state
+        .personas
+        .resolve()
+        .warnings
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
     let response = authorize(state, headers, form);
     attach(
         response,
         LogDetail {
             client_id,
             request: Some(request),
+            warnings: (!warnings.is_empty()).then_some(warnings),
             ..LogDetail::default()
         },
     )
@@ -183,7 +197,7 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     // which is the coherent reading: the answer is "you have to ask", and
     // `prompt=none` is the request not to.
     if request.prompt == Some(Prompt::None) {
-        return match usable.and_then(|selection| resolve(state, &selection)) {
+        return match usable.and_then(|selection| resolve(state, &request.client_id, &selection)) {
             Some((persona, auth_time)) => with_optional_cookie(
                 complete(state, request, persona, auth_time, session_id.clone()),
                 session_id,
@@ -198,7 +212,9 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
         };
     }
 
-    if let Some((persona, auth_time)) = usable.and_then(|selection| resolve(state, &selection)) {
+    if let Some((persona, auth_time)) =
+        usable.and_then(|selection| resolve(state, &request.client_id, &selection))
+    {
         return with_optional_cookie(
             complete(state, request, persona, auth_time, session_id.clone()),
             session_id,
@@ -222,11 +238,16 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
 /// changed under it — a file edited, or lanyard restarted with a different one.
 /// A selection that no longer names anybody falls through to the picker rather
 /// than failing the login.
-fn resolve(state: &SharedState, selection: &Selection) -> Option<(Persona, u64)> {
+/// Scoped by the request's own `client_id`: a persona that has since been
+/// scoped to a *different* application no longer names anybody **for this
+/// login**, and falls through to the picker like any other id that stopped
+/// resolving.
+fn resolve(state: &SharedState, client_id: &str, selection: &Selection) -> Option<(Persona, u64)> {
     state
         .personas
-        .get(&selection.persona_id)
-        .map(|persona| (persona.clone(), selection.auth_time))
+        .resolve()
+        .get(&selection.persona_id, Some(client_id))
+        .map(|sourced| (sourced.persona.clone(), selection.auth_time))
 }
 
 /// Mint the code and hand back the authorization response. Both the picker's

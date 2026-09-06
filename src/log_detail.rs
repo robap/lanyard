@@ -28,6 +28,14 @@ pub struct LogDetail {
     pub detail: Option<Map<String, Value>>,
     pub issued: Option<Map<String, Value>>,
     pub flaw: Option<String>,
+    /// What is wrong with the persona sources right now, if anything.
+    ///
+    /// **Not something this request did** — it is the state of the world the
+    /// request was answered in, riding back on the request that was about to
+    /// get the wrong picker anyway. `/_/` emits no event by Phase 6's design
+    /// ("a page is not a decision"), so a broken project file reaches the log
+    /// on the next protocol request rather than on the page reload.
+    pub warnings: Option<Vec<String>>,
 }
 
 impl LogDetail {
@@ -47,6 +55,7 @@ impl LogDetail {
         self.detail = self.detail.take().or(other.detail);
         self.issued = self.issued.take().or(other.issued);
         self.flaw = self.flaw.take().or(other.flaw);
+        self.warnings = self.warnings.take().or(other.warnings);
     }
 }
 

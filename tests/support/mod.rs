@@ -16,6 +16,7 @@ use lanyard_cli::config::Config;
 use lanyard_cli::events::EventBus;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
+use lanyard_cli::registry::Registry;
 use lanyard_cli::store::Stores;
 
 pub const ISSUER: &str = "http://127.0.0.1:9500/oidc";
@@ -46,6 +47,14 @@ pub async fn spawn_with(personas: Personas) -> String {
     spawn_configured(personas, Stores::default()).await
 }
 
+/// A server over a real [`Registry`] — the sources on disk, re-read as they
+/// change. Everything else in this harness hands over one already-parsed list,
+/// which is the right shape for a test about a grant and the wrong one for a
+/// test about where personas come from.
+pub async fn spawn_with_registry(registry: Registry) -> String {
+    spawn_observed_registry(registry, Stores::default()).await.0
+}
+
 pub async fn spawn_configured(personas: Personas, stores: Stores) -> String {
     spawn_observed(personas, stores).await.0
 }
@@ -53,6 +62,10 @@ pub async fn spawn_configured(personas: Personas, stores: Stores) -> String {
 /// The server **and its event bus**, for the tests that assert on what was
 /// logged rather than on what was answered.
 pub async fn spawn_observed(personas: Personas, stores: Stores) -> (String, EventBus) {
+    spawn_observed_registry(Registry::fixed(personas), stores).await
+}
+
+pub async fn spawn_observed_registry(personas: Registry, stores: Stores) -> (String, EventBus) {
     let config = Config::resolve(|key| match key {
         "HOME" => Some("/nonexistent".to_string()),
         _ => None,
@@ -174,6 +187,39 @@ fn complete_records(out: &str) -> usize {
 /// Everything the bus has retained, in order.
 pub fn logged(events: &EventBus) -> Vec<lanyard_cli::events::Event> {
     events.subscribe(None).0
+}
+
+/// The real binary, run the way a shell runs it, with a clean environment plus
+/// whatever the caller names.
+///
+/// `env_clear` and a `HOME` that does not exist, so nothing here can read or
+/// write a developer's real config directory — the registry these tests write
+/// is always one `LANYARD_LINKS` points at.
+pub fn run(env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_lanyard"));
+    command
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    // `cargo llvm-cov` tells an instrumented child where to write its profile;
+    // a child that loses it drops a stray `default_*.profraw` in the repository
+    // root and reports 0% for `main.rs`.
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command.output().unwrap()
+}
+
+pub fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+pub fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
 }
 
 /// A client that stops at the first response. Following a `302` to

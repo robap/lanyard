@@ -96,6 +96,96 @@ async fn the_picker_with_a_req_offers_one_form_per_person() {
     assert!(!body.contains("cdn."), "no CDN");
 }
 
+/// **The visibility rule, on the page it exists for.** The picker shows that
+/// application's people: a persona scoped to `billing-web` is a button on
+/// `billing-web`'s picker and is not on anybody else's.
+#[tokio::test]
+async fn the_picker_shows_only_the_people_this_client_id_can_see() {
+    let personas = lanyard_cli::persona::Personas::parse(
+        "personas:\n  - id: ada\n  - id: dev-admin\n    client: billing-web\n\
+         \x20 - id: qa-bot\n    client: spike-php\n",
+        std::path::Path::new("/tmp/users.yaml"),
+    )
+    .unwrap();
+    let base = spawn_with(personas).await;
+    let http = client();
+
+    async fn buttons(base: &str, http: &reqwest::Client, client_id: &str) -> Vec<String> {
+        let req = start(
+            base,
+            http,
+            &format!("client_id={client_id}&response_type=code&redirect_uri={ADA_CB}"),
+        )
+        .await;
+        let body = reqwest::get(format!("{base}/_/?req={req}"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        ["ada", "dev-admin", "qa-bot"]
+            .into_iter()
+            .filter(|id| body.contains(&format!("name=\"persona\" value=\"{id}\"")))
+            .map(str::to_string)
+            .collect()
+    }
+
+    assert_eq!(
+        buttons(&base, &http, "billing-web").await,
+        ["ada", "dev-admin"],
+        "billing-web sees its own person and the unscoped one"
+    );
+    assert_eq!(
+        buttons(&base, &http, "spike-php").await,
+        ["ada", "qa-bot"],
+        "and the reverse for the other project"
+    );
+}
+
+/// The picker can never be emptied by scoping: a login from a `client_id`
+/// nobody scoped to still gets the unscoped people, and completes.
+#[tokio::test]
+async fn an_unrecognised_client_id_sees_the_unscoped_people_and_logs_in() {
+    let personas = lanyard_cli::persona::Personas::parse(
+        "personas:\n  - id: ada\n  - id: dev-admin\n    client: billing-web\n",
+        std::path::Path::new("/tmp/users.yaml"),
+    )
+    .unwrap();
+    let base = spawn_with(personas).await;
+    let http = client();
+
+    let req = start(
+        &base,
+        &http,
+        &format!("client_id=nobody-scoped-to-me&response_type=code&redirect_uri={ADA_CB}"),
+    )
+    .await;
+    let body = reqwest::get(format!("{base}/_/?req={req}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("name=\"persona\" value=\"ada\""), "{body}");
+    assert!(
+        !body.contains("name=\"persona\" value=\"dev-admin\""),
+        "a scoped persona is on nobody else's picker: {body}"
+    );
+
+    // North star 1: the rule filters a list, it never gates a grant.
+    let res = http
+        .post(format!("{base}/_/pick"))
+        .form(&[("req", req.as_str()), ("persona", "ada")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 302);
+    assert!(res.headers()["location"]
+        .to_str()
+        .unwrap()
+        .contains("code="));
+}
+
 /// Criterion 27. A persona file can come out of a fixture generator, and a
 /// picker that executes its own persona list is a bad look for a tool whose
 /// pitch is "it catches your bugs".

@@ -8,6 +8,7 @@ use lanyard_cli::app::{self, AppState};
 use lanyard_cli::config::Config;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
+use lanyard_cli::registry::Registry;
 use lanyard_cli::store::Stores;
 
 /// A server on an ephemeral port, with the issuer still the canonical fixed
@@ -27,7 +28,7 @@ async fn spawn_with(personas: Personas) -> String {
     let state = Arc::new(AppState {
         config,
         key,
-        personas,
+        personas: Registry::fixed(personas),
         stores: Stores::default(),
         events: lanyard_cli::events::EventBus::new(),
     });
@@ -362,10 +363,12 @@ async fn personas_lists_the_built_in_defaults() {
     assert_eq!(ada["roles"], serde_json::json!(["admin", "user"]));
 }
 
-/// Both `client:` levels are echoed back so that whichever shape Phase 7 wants
-/// is already there. Nothing filters on it — every persona is still listed.
+/// Unfiltered, every row carries the `client:` that **actually applies to it** —
+/// a file-level value resolved onto the personas that declared none, and a
+/// persona-level one left alone. The debugging view has to answer "which client
+/// is this person scoped to" without the reader re-deriving the two levels.
 #[tokio::test]
-async fn personas_echoes_client_at_both_levels() {
+async fn personas_resolves_client_onto_every_row_and_names_the_source() {
     let personas = Personas::parse(
         "client: billing-web\npersonas:\n  - id: ada\n  - id: ops\n    client: ops-console\n",
         std::path::Path::new("/tmp/users.yaml"),
@@ -380,11 +383,193 @@ async fn personas_echoes_client_at_both_levels() {
         .await
         .unwrap();
 
-    assert_eq!(body["client"], "billing-web");
     let list = body["personas"].as_array().unwrap();
-    assert_eq!(list.len(), 2);
-    assert!(list[0].get("client").is_none());
-    assert_eq!(list[1]["client"], "ops-console");
+    assert_eq!(list.len(), 2, "unfiltered lists every persona");
+    assert_eq!(list[0]["id"], "ada");
+    assert_eq!(list[0]["client"], "billing-web", "the file-level value");
+    assert_eq!(list[0]["source"], "/tmp/users.yaml");
+    assert_eq!(list[1]["client"], "ops-console", "its own beats the file's");
+}
+
+/// **The visibility rule at the seam.** A persona scoped to one `client_id` is
+/// listed for it and for nobody else — including for a request that names no
+/// client at all, which is not an exemption.
+#[tokio::test]
+async fn personas_filters_by_client_id_when_asked() {
+    let personas = Personas::parse(
+        "personas:\n  - id: ada\n  - id: dev-admin\n    client: billing-web\n",
+        std::path::Path::new("/tmp/users.yaml"),
+    )
+    .unwrap();
+    let base = spawn_with(personas).await;
+
+    async fn ids(base: &str, query: &str) -> Vec<String> {
+        let body: serde_json::Value = reqwest::get(format!("{base}/_/api/personas{query}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["personas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    assert_eq!(
+        ids(&base, "?client_id=billing-web").await,
+        ["ada", "dev-admin"]
+    );
+    assert_eq!(ids(&base, "?client_id=node-spa").await, ["ada"]);
+    assert_eq!(ids(&base, "").await, ["ada", "dev-admin"], "unfiltered");
+}
+
+// ------------------------------------ the visibility rule on the protocol --
+
+/// A file whose `dev-admin` belongs to `billing-web` and whose `ada` belongs to
+/// everybody — the shape every one of these assertions is about.
+fn scoped_personas() -> Personas {
+    Personas::parse(
+        "personas:\n\
+         \x20 - id: ada\n\
+         \x20 - id: dev-admin\n\
+         \x20   email: admin@billing.test\n\
+         \x20   client: billing-web\n",
+        std::path::Path::new("/home/dev/code/billing/lanyard.yaml"),
+    )
+    .unwrap()
+}
+
+/// `lanyard token` mints from the same set the picker shows. The `client_id` on
+/// the grant is what says which set that is — and it is a form parameter
+/// lanyard already accepted from anyone, not a registration.
+#[tokio::test]
+async fn client_credentials_mints_only_from_the_set_its_client_id_can_see() {
+    let base = spawn_with(scoped_personas()).await;
+
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", "node-spa"),
+            ("persona", "dev-admin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, _, body) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("client_id", "billing-web"),
+            ("persona", "dev-admin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let claims = payload_of(body["access_token"].as_str().unwrap());
+    assert_eq!(claims["sub"], "dev-admin");
+    assert_eq!(claims["client_id"], "billing-web");
+}
+
+/// No `client_id` at all is not an exemption: it sees what an unrecognised one
+/// sees, which is the unscoped people — and those still mint.
+#[tokio::test]
+async fn a_grant_with_no_client_id_sees_exactly_the_unscoped_people() {
+    let base = spawn_with(scoped_personas()).await;
+
+    let (status, _, _) = post_grant(
+        &base,
+        &[
+            ("grant_type", "client_credentials"),
+            ("persona", "dev-admin"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    let (status, _, body) = post_grant(
+        &base,
+        &[("grant_type", "client_credentials"), ("persona", "ada")],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        payload_of(body["access_token"].as_str().unwrap())["sub"],
+        "ada"
+    );
+}
+
+/// **The `sub` lookup is scoped like the mint was.** UserInfo reads the
+/// `client_id` claim off the presented token, so a token minted for a scoped
+/// persona resolves back to *that persona* rather than to nobody.
+///
+/// The token is minted through the seam with **only** a `sub`, so the persona's
+/// email can have come from exactly one place: the scoped lookup. A token that
+/// already carried the claims would pass this whether the lookup worked or not
+/// — `filtered_from_token` would answer for it.
+#[tokio::test]
+async fn userinfo_scopes_its_sub_lookup_by_the_tokens_client_id() {
+    let base = spawn_with(scoped_personas()).await;
+
+    async fn userinfo_for(base: &str, client_id: &str) -> serde_json::Value {
+        let (status, body) = post_token(
+            base,
+            "",
+            &format!(
+                r#"{{"sub": "dev-admin", "client_id": "{client_id}", "scope": "openid email"}}"#
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        reqwest::Client::new()
+            .get(format!("{base}/oidc/userinfo"))
+            .bearer_auth(body["token"].as_str().unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    let claims = userinfo_for(&base, "billing-web").await;
+    assert_eq!(claims["sub"], "dev-admin");
+    assert_eq!(
+        claims["email"], "admin@billing.test",
+        "the persona was found, scoped by the token's client_id"
+    );
+
+    // The same `sub`, presented by an application the persona is invisible to:
+    // there is nobody to look up, and nothing but the token itself to answer
+    // from.
+    let claims = userinfo_for(&base, "node-spa").await;
+    assert_eq!(claims["sub"], "dev-admin");
+    assert!(
+        claims.get("email").is_none(),
+        "an unscoped lookup must not reach a scoped persona: {claims}"
+    );
+}
+
+/// The seam's `client_id` is a query parameter, and absent behaves as a
+/// `client_id` nobody scoped to.
+#[tokio::test]
+async fn the_seam_scopes_its_persona_lookup_too() {
+    let base = spawn_with(scoped_personas()).await;
+
+    let (status, _) = post_token(&base, "?persona=dev-admin", "{}").await;
+    assert_eq!(status, 400, "no client_id sees only the unscoped people");
+
+    let (status, _) = post_token(&base, "?persona=dev-admin&client_id=node-spa", "{}").await;
+    assert_eq!(status, 400);
+
+    let (status, body) = post_token(&base, "?persona=dev-admin&client_id=billing-web", "{}").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["claims"]["sub"], "dev-admin");
 }
 
 // ----------------------------------------------------------- /oidc/token --

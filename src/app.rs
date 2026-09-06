@@ -5,7 +5,7 @@ use axum::Router;
 use crate::config::Config;
 use crate::events::EventBus;
 use crate::keys::SigningKey;
-use crate::persona::Personas;
+use crate::registry::Registry;
 use crate::store::Stores;
 
 /// Everything resolved once at startup and shared, read-only, by every handler.
@@ -13,7 +13,11 @@ use crate::store::Stores;
 pub struct AppState {
     pub config: Config,
     pub key: SigningKey,
-    pub personas: Personas,
+    /// **Not a list — a merged view of many sources, re-resolved on demand.**
+    /// Phase 7 replaced an immutable field with this so that editing a linked
+    /// project's `lanyard.yaml` needs no restart; every handler that needs
+    /// people calls `resolve()` once and reads the snapshot it gets back.
+    pub personas: Registry,
     /// The only mutable state in the process, and all of it dies with the
     /// process: pending authorization requests, authorization codes, and
     /// sessions. Nothing here is persisted, which is why restarting lanyard

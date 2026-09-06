@@ -307,10 +307,24 @@ function Row(e: LogEvent, expanded: Signal<number | null>, now: Signal<number>):
  */
 function summary(e: LogEvent): string {
   if (e.error !== null) {
-    return e.error_description === null ? e.error : `${e.error} — ${e.error_description}`;
+    const failure =
+      e.error_description === null ? e.error : `${e.error} — ${e.error_description}`;
+    return [failure, ...warningTail(e)].join("  ");
   }
   const parts = [e.grant_type, e.flaw === null ? null : `flaw=${e.flaw}`];
-  return parts.filter((part) => part !== null).join("  ");
+  return parts.filter((part) => part !== null).concat(warningTail(e)).join("  ");
+}
+
+/**
+ * The warnings as they read on the row, matching the `warning: …` tail
+ * `lanyard serve` prints. Last and always — on a success and on a failure
+ * alike, because it is not what this request did but what is wrong while it was
+ * being answered.
+ * @param {LogEvent} e
+ * @returns {string[]}
+ */
+function warningTail(e: LogEvent): string[] {
+  return (e.warnings ?? []).map((w) => `warning: ${w}`);
 }
 
 /**
@@ -323,11 +337,29 @@ function Detail(e: LogEvent, now: Signal<number>): TemplateResult {
   return html`
     <td class="detail-cell" colspan="7">
       <div class="stack gap-md pad-md">
+        ${WarningsPanel(e)}
         ${PkcePanel(e)}
         ${Object.keys(issued).map((name) => TokenPanel(name, issued[name]!, now))}
         ${RequestPanel(e)}
       </div>
     </td>
+  `;
+}
+
+/**
+ * Every warning, in full. The row's cell carries the same sentences, but a
+ * shadowed id names two file paths and that does not fit in a table cell.
+ * @param {LogEvent} e
+ * @returns {TemplateResult | string}
+ */
+function WarningsPanel(e: LogEvent): TemplateResult | string {
+  const warnings = e.warnings ?? [];
+  if (warnings.length === 0) return "";
+  return html`
+    <section class="warnings-panel stack gap-xs">
+      <h3 class="text-h4">persona sources</h3>
+      ${warnings.map((w) => html`<p class="warning-line text-small">${w}</p>`)}
+    </section>
   `;
 }
 

@@ -14,9 +14,14 @@ use lanyard_cli::client::{self, MintRequest};
 use lanyard_cli::config::Config;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
+use lanyard_cli::registry::Registry;
 use lanyard_cli::store::Stores;
 
 async fn spawn() -> String {
+    spawn_with(Personas::builtin()).await
+}
+
+async fn spawn_with(personas: Personas) -> String {
     let config = Config::resolve(|key| match key {
         "HOME" => Some("/nonexistent".to_string()),
         _ => None,
@@ -26,7 +31,7 @@ async fn spawn() -> String {
     let state = Arc::new(AppState {
         config,
         key,
-        personas: Personas::builtin(),
+        personas: Registry::fixed(personas),
         stores: Stores::default(),
         events: lanyard_cli::events::EventBus::new(),
     });
@@ -161,6 +166,7 @@ async fn mint_performs_a_real_grant_and_returns_the_access_token() {
     let base = spawn().await;
     let token = client::mint(&MintRequest {
         url: &base,
+        client_id: client::CLI_CLIENT_ID,
         persona: "ada",
         audience: Some("billing-api"),
         scope: Some("orders:read"),
@@ -184,6 +190,7 @@ async fn nothing_listening_names_the_url_and_the_fix() {
     let url = dead_url().await;
     let error = client::mint(&MintRequest {
         url: &url,
+        client_id: client::CLI_CLIENT_ID,
         persona: "ada",
         audience: None,
         scope: None,
@@ -207,6 +214,7 @@ async fn a_rejected_grant_surfaces_the_servers_description() {
     let base = spawn().await;
     let error = client::mint(&MintRequest {
         url: &base,
+        client_id: client::CLI_CLIENT_ID,
         persona: "nope",
         audience: None,
         scope: None,
@@ -226,6 +234,7 @@ async fn mint_posts_the_flaw_as_one_more_form_field() {
     let base = spawn().await;
     let token = client::mint(&MintRequest {
         url: &base,
+        client_id: client::CLI_CLIENT_ID,
         persona: "ada",
         audience: Some("billing-api"),
         scope: None,
@@ -359,6 +368,107 @@ async fn an_unknown_persona_names_the_id_on_stderr() {
     let base = spawn().await;
     let output = run(Some(&base), &["token", "--as", "nope"]);
     assert!(stderr(&output).contains("nope"), "{}", stderr(&output));
+}
+
+/// `--client` is not a new concept: it sets the `client_id` on a grant lanyard
+/// already accepts from anyone. It is what reaches a scoped persona from a
+/// shell, and it lands in the token's `client_id` claim like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_reaches_a_scoped_persona_and_lands_in_the_claim() {
+    let base = spawn_with(
+        Personas::parse(
+            "personas:\n  - id: dev-admin\n    client: billing-web\n",
+            std::path::Path::new("/home/dev/code/billing/lanyard.yaml"),
+        )
+        .unwrap(),
+    )
+    .await;
+
+    let output = run(
+        Some(&base),
+        &[
+            "token",
+            "--as",
+            "dev-admin",
+            "--client",
+            "billing-web",
+            "--aud",
+            "billing-api",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let claims = payload_of(stdout(&output).trim());
+    assert_eq!(claims["sub"], "dev-admin");
+    assert_eq!(claims["client_id"], "billing-web");
+    assert_eq!(claims["aud"], "billing-api");
+}
+
+/// The default is unchanged, and it is what the refusal above names.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_client_the_grant_still_says_lanyard_cli() {
+    let base = spawn().await;
+    let output = run(Some(&base), &["token", "--as", "ada"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        payload_of(stdout(&output).trim())["client_id"],
+        "lanyard-cli"
+    );
+}
+
+/// `env` takes the same flag: the two subcommands share [`MintArgs`], and a
+/// scoped persona that `token` could reach and `env` could not would be a
+/// difference with no reason behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn env_takes_client_too() {
+    let base = spawn_with(
+        Personas::parse(
+            "personas:\n  - id: dev-admin\n    client: billing-web\n",
+            std::path::Path::new("/tmp/lanyard.yaml"),
+        )
+        .unwrap(),
+    )
+    .await;
+
+    let output = run(
+        Some(&base),
+        &["env", "--as", "dev-admin", "--client", "billing-web"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let token = stdout(&output)
+        .strip_prefix("export BEARER_TOKEN='")
+        .and_then(|rest| rest.strip_suffix("'\n"))
+        .unwrap()
+        .to_string();
+    assert_eq!(payload_of(&token)["sub"], "dev-admin");
+}
+
+/// **The message that makes namespacing usable rather than maddening.**
+///
+/// The CLI sends `client_id=lanyard-cli`, so a persona scoped to `billing-web`
+/// is invisible to it. `no such persona` would be true and useless — the file
+/// is right there. Written by the server at its one refusal funnel and
+/// surfaced verbatim, so there is one copy of the sentence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persona_scoped_to_another_client_says_where_it_is_and_which_flag_reaches_it() {
+    let base = spawn_with(
+        Personas::parse(
+            "personas:\n  - id: dev-admin\n    client: billing-web\n",
+            std::path::Path::new("/home/dev/code/billing/lanyard.yaml"),
+        )
+        .unwrap(),
+    )
+    .await;
+
+    let output = run(Some(&base), &["token", "--as", "dev-admin"]);
+    assert!(!output.status.success(), "must exit non-zero");
+    assert_eq!(stdout(&output), "", "stdout stays empty on a refusal");
+    assert_eq!(
+        stderr(&output),
+        "lanyard: no persona \"dev-admin\" for client \"lanyard-cli\" — it is defined in \
+         /home/dev/code/billing/lanyard.yaml scoped to client \"billing-web\". \
+         Retry with --client billing-web\n"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -501,6 +611,7 @@ async fn a_reply_that_is_not_a_token_names_the_url_and_the_status() {
     let wrong = format!("{base}/_");
     let error = client::mint(&MintRequest {
         url: &wrong,
+        client_id: client::CLI_CLIENT_ID,
         persona: "ada",
         audience: None,
         scope: None,
@@ -522,6 +633,7 @@ async fn an_https_url_fails_with_a_message_that_still_names_it() {
     let url = "https://127.0.0.1:9500";
     let error = client::mint(&MintRequest {
         url,
+        client_id: client::CLI_CLIENT_ID,
         persona: "ada",
         audience: None,
         scope: None,

@@ -27,6 +27,14 @@ export type LogEvent = {
   detail: Record<string, unknown> | null;
   issued: Record<string, DecodedToken> | null;
   flaw: string | null;
+  /**
+   * What is wrong with the server's persona sources as of this request — a
+   * linked project that moved, a file that stopped parsing, a shadowed id.
+   * **Absent when nothing is wrong**, unlike the fields above: the server skips
+   * it entirely so that `lanyard logs --json | jq 'select(.warnings)'` is the
+   * whole filter.
+   */
+  warnings?: string[];
 };
 
 /** The filter value that means "every application". */

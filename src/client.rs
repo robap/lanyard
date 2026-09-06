@@ -52,6 +52,10 @@ fn trim(url: &str) -> String {
 pub struct MintRequest<'a> {
     pub url: &'a str,
     pub persona: &'a str,
+    /// What the grant names itself as, and therefore **which personas it can
+    /// see**. Defaults to [`CLI_CLIENT_ID`]; `--client` is how a shell reaches
+    /// a persona a project scoped to its own application.
+    pub client_id: &'a str,
     pub audience: Option<&'a str>,
     pub scope: Option<&'a str>,
     /// The wire value of a [`crate::oidc::flaw::Flaw`], passed straight through.
@@ -115,7 +119,7 @@ pub async fn mint(request: &MintRequest<'_>) -> Result<String, MintError> {
 
     let mut form = vec![
         ("grant_type", "client_credentials"),
-        ("client_id", CLI_CLIENT_ID),
+        ("client_id", request.client_id),
         ("persona", request.persona),
     ];
     if let Some(audience) = request.audience {

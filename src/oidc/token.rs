@@ -93,13 +93,24 @@ fn dispatch(state: &SharedState, headers: &HeaderMap, form: &Form) -> Response {
 /// arriving at the endpoint where every other IdP would put a client registry,
 /// and it is what produces the multi-project property.
 fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> Response {
+    let client_id = form
+        .get("client_id")
+        .map(str::to_string)
+        .or_else(|| basic_client_id(headers));
+
+    // **Scoped like the picker is.** `lanyard token` mints from the same set
+    // the picker shows, which is the whole reason `--client` exists.
+    let people = state.personas.resolve();
     let persona = match form.get("persona") {
-        Some(id) => match state.personas.get(id) {
-            Some(persona) => Some(persona),
+        Some(id) => match people.get(id, client_id.as_deref()) {
+            Some(sourced) => Some(&sourced.persona),
+            // **The useful refusal**, through the funnel every other one goes
+            // through: a persona that exists but belongs to another
+            // application says so, and names the flag that reaches it.
             None => {
                 return bad_request(
                     "invalid_request",
-                    format!("no persona with id {id:?} is loaded"),
+                    people.missing_persona(id, client_id.as_deref()),
                 )
             }
         },
@@ -134,12 +145,8 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
     // Emitted only when the request supplied one, matching what a real
     // `client_credentials` token carries and giving Phase 6's log and Phase 7's
     // namespacing something honest to key on.
-    if let Some(client_id) = form
-        .get("client_id")
-        .map(str::to_string)
-        .or_else(|| basic_client_id(headers))
-    {
-        overrides.insert("client_id".into(), Value::from(client_id));
+    if let Some(client_id) = &client_id {
+        overrides.insert("client_id".into(), Value::from(client_id.clone()));
     }
 
     match issue::issue(

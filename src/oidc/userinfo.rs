@@ -81,9 +81,15 @@ async fn userinfo(State(state): State<SharedState>, headers: HeaderMap) -> Respo
     // The scope to filter by is the one the token was granted.
     let filter = ClaimFilter::ByScope(Scopes::parse(claims.get("scope").and_then(Value::as_str)));
 
-    let body = match state.personas.get(sub) {
+    // **Scoped like the mint was.** The `client_id` claim on the presented token
+    // is the application this request is for, so the `sub`→persona lookup uses
+    // it — looking `sub` up against the unscoped set would answer with somebody
+    // the token was never minted for.
+    let token_client = claims.get("client_id").and_then(Value::as_str);
+    let people = state.personas.resolve();
+    let body = match people.get(sub, token_client) {
         // The ordinary case: the same table, read again with a filter.
-        Some(persona) => persona_claims(persona, &filter),
+        Some(sourced) => persona_claims(&sourced.persona, &filter),
         // An identity minted from the picker's "mint one now" panel is in no
         // file, so there is nothing to look up. Its claims are already in the
         // token — put there by `persona_claims` with no filter — so filtering
@@ -102,10 +108,7 @@ async fn userinfo(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         )
             .into_response(),
         LogDetail {
-            client_id: claims
-                .get("client_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            client_id: token_client.map(str::to_string),
             detail: Some(
                 [("sub".to_string(), Value::from(sub))]
                     .into_iter()

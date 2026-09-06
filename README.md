@@ -153,16 +153,17 @@ options.TokenValidationParameters.ClockSkew = TimeSpan.Zero;
 
 Measured both ways in [`docs/decisions/dotnet-jwt-bearer-settings.md`](docs/decisions/dotnet-jwt-bearer-settings.md).
 
-**Scope.** This is Phase 5. There is a discovery document, a JWKS, all three
+**Scope.** This is Phase 7. There is a discovery document, a JWKS, all three
 arms of `/oidc/token` — `client_credentials`, `authorization_code` and
 `refresh_token` — plus `/oidc/authorize`, `/oidc/userinfo`,
 `/oidc/end_session`, `/oidc/introspect`, `/oidc/revoke`, the persona picker at
-`/_/` with its three session controls, browser sessions, the `token` and `env`
-CLI commands, the six deliberate failure flags, and the test seam. There is no
-request log yet, no back-channel or front-channel logout, no `sid` in the ID
-token, no `check_session_iframe`, nothing persisted across a restart, and no
-consent screen — a consent screen is client registration in a different
-costume.
+`/_/` with its three session controls, browser sessions, the live request log at
+`/_/log` and `lanyard logs`, project personas via `lanyard link` and `client:`
+namespacing, the `token` and `env` CLI commands, the six deliberate failure
+flags, and the test seam. There is no back-channel or front-channel logout, no
+`sid` in the ID token, no `check_session_iframe`, nothing persisted across a
+restart *except the list of linked project directories*, and no consent screen —
+a consent screen is client registration in a different costume.
 
 ## Configuration
 
@@ -174,7 +175,8 @@ Every setting is an environment variable read once at startup. All are optional.
 | `LANYARD_BIND` | `127.0.0.1` | Listen address |
 | `LANYARD_PORT` | `9500` | Listen port |
 | `LANYARD_DATA_DIR` | `$XDG_DATA_HOME/lanyard` | Signing key lives here |
-| `LANYARD_PERSONAS` | `$XDG_CONFIG_HOME/lanyard/users.yaml` | Persona file; when set, it must exist |
+| `LANYARD_PERSONAS` | `$XDG_CONFIG_HOME/lanyard/users.yaml` | Global persona file; when set, it must exist |
+| `LANYARD_LINKS` | `$XDG_CONFIG_HOME/lanyard/links.yaml` | Linked persona files; absent means none, set or not |
 | `LANYARD_URL` | `http://127.0.0.1:{port}` | Where `lanyard token` and `lanyard env` reach the server |
 
 `LANYARD_URL` is an address; `LANYARD_ISSUER` is a string that goes in a token.
@@ -208,7 +210,7 @@ remembers to create.
 Point `LANYARD_PERSONAS` at a YAML file to replace all three:
 
 ```yaml
-client: billing-web          # optional, file-level. Reserved for a later phase.
+client: billing-web          # optional, file-level
 personas:
   - id: ada
     name: Ada Bell
@@ -227,8 +229,74 @@ exit non-zero naming the offending key and the file path. There is no fallback t
 the defaults: a persona that silently failed to load shows up three redirects
 later as a name missing from the picker.
 
-`client:` is accepted at both levels, echoed back by `/_/api/personas`, and read
-by nothing yet.
+## Personas that travel with the repo
+
+A project commits a `lanyard.yaml` — the same schema as above — and each
+developer links it once:
+
+```
+$ lanyard link ~/code/billing/lanyard.yaml
+linked /home/dev/code/billing/lanyard.yaml — 3 personas for client billing-web
+  dev-admin, billing-readonly, locked-out
+
+$ lanyard links
+/home/dev/.config/lanyard/links.yaml
+
+/home/dev/code/billing/lanyard.yaml    billing-web  dev-admin, billing-readonly, locked-out
+/home/dev/code/ops-console/dev.yaml    —            ops-bot
+/home/dev/code/old-thing/lanyard.yaml  missing      (no such file)
+
+$ lanyard unlink ~/code/billing/lanyard.yaml
+```
+
+`links` leads with the registry's own path, so `LANYARD_LINKS` pointing
+somewhere unexpected is visible rather than inferred.
+
+The file is **named, never discovered** — nothing is inferred from the working
+directory, and the name `lanyard.yaml` is only a convention. `link` validates
+the file, records it absolute, is idempotent, and needs no running server: a
+running `lanyard serve` picks the change up on its next request.
+
+### The visibility rule
+
+> **A persona is visible to a request if it declares no `client:`, or if its
+> `client:` equals that request's `client_id`.**
+
+Applied at `/oidc/authorize`, `/oidc/token`, `/oidc/userinfo`, `/_/`,
+`/_/api/personas` and `/_/api/token`. A persona-level `client:` beats the
+file-level one, and a request with no `client_id` sees what an unrecognised one
+sees: the unscoped personas.
+
+**It is not registration.** lanyard still accepts any `client_id` from anyone;
+the rule filters a list a human reads, it never gates a grant.
+
+### Merging
+
+Three sources: the built-ins, the global file (which still replaces them), and
+every linked file in registry order. **Links add; they never subtract** — so
+`nobody` survives linking a project, and the picker can never be emptied by a
+link going bad. Use `client:` to hide the *other* projects' people.
+
+When two personas visible to the same request share an id: scoped beats
+unscoped, then project beats global, then **first-linked wins**. Every
+shadowing warns, naming the files and which one won.
+
+### Broken files warn; a broken `users.yaml` is still fatal
+
+A machine-wide daemon must not die because one of ten projects has a typo. The
+fatal-ness moves to `lanyard link`, which parses the file and refuses a bad one.
+At serve time a file that breaks later, or one that has gone missing, is a
+**warning**: that file contributes nothing and everything else still resolves.
+
+Warnings appear in four places — the startup banner, a band on `/_/`, the event
+stream (`lanyard logs --json | jq 'select(.warnings)'`, `/_/log`), and
+`warnings` on `/_/api/personas`.
+
+### Live, without a watcher
+
+Edit a linked file, reload `/_/`, see the change. Each source is re-read only
+when a `stat` says its modified time or length moved — no `notify`, no watcher
+thread, no atomic-rename problem.
 
 ## Minting a token from the command line
 
@@ -242,6 +310,21 @@ eyJhbGciOiJSUzI1NiIsImtpZCI6...
 $ curl -H "Authorization: Bearer $(lanyard token --as ada --aud billing-api)" \
        localhost:8080/orders
 ```
+
+`--client` sets the grant's `client_id`, and therefore which personas the CLI
+can see. Without it the CLI is `lanyard-cli`, so a scoped persona is invisible —
+and the refusal says where it is rather than `no such persona`:
+
+```
+$ lanyard token --as dev-admin
+lanyard: no persona "dev-admin" for client "lanyard-cli" — it is defined in
+  /home/dev/code/billing/lanyard.yaml scoped to client "billing-web".
+  Retry with --client billing-web
+
+$ lanyard token --as dev-admin --client billing-web --aud billing-api
+```
+
+A project that links a file without declaring `client:` needs none of this.
 
 `lanyard token` prints the token and a newline on stdout and nothing else — no
 banner, no timing, no "minted for Ada" — so `$(...)` drops it straight into a
@@ -434,12 +517,20 @@ so your app's own error handling runs.
   naming the person and when they were chosen, each with **Forget** and
   **Expire now**, plus **Log out of lanyard** below them. See
   [Logging out](#three-controls-on-_).
-- Visiting `/_/` with no login in progress lists the same people and says so.
-  That is the URL the banner prints.
+- **Filtered to the people this application can see.** The page says how many it
+  hid and offers **Show all** — every persona, labelled with its client and its
+  file, without dropping the login. A persona this application cannot see is a
+  card there, never a button.
+- Visiting `/_/` with no login in progress is that unfiltered view. That is the
+  URL the banner prints.
+- **A band at the top** when a persona source is broken, naming the path and the
+  error.
 
-Persona display strings are HTML-escaped. A persona file is your own, but its
-`attributes` can come out of a fixture generator, and a picker that executes its
-own persona list is a bad look for a tool whose pitch is "it catches your bugs".
+Persona display strings are HTML-escaped, and so are the `client:` labels and
+file paths this page now renders. A persona file is your own, but a project's
+`lanyard.yaml` came out of a repository somebody cloned, and a picker that
+executes its own persona list is a bad look for a tool whose pitch is "it
+catches your bugs".
 
 The page is server-rendered HTML with one stylesheet inlined by `include_str!`.
 No template engine, no bundler, no `npm`, nothing generated at build time:
@@ -630,6 +721,22 @@ PKCE (S256)
 ```
 
 Which two were meant to be equal is not something you have to be told.
+
+**Warnings about persona sources ride on the events**, not because the request
+caused them but because it was answered while they were true — and it is the
+request that was about to get the wrong picker. `/_/` emits nothing (a page is
+not a decision), so a project file that breaks reaches the log on the next
+protocol request:
+
+```
+14:07:02  billing-web   GET  /oidc/authorize   302    0ms  dev-admin  warning: /home/dev/code/billing: linked directory does not exist
+
+lanyard logs --json | jq 'select(.warnings)'
+```
+
+The field is **absent** when nothing is wrong, so that `select(.warnings)` is
+the whole filter. On `/_/log` the same sentences are on the row and, in full, in
+the expanded panel.
 
 ### The endpoints, if you want the stream yourself
 
@@ -908,6 +1015,7 @@ curl -sX POST http://127.0.0.1:9500/_/api/token \
 | `persona` | none | Mint a persona's claims: `?persona=ada` |
 | `ttl` | `60` | Lifetime in seconds; `exp - iat` |
 | `flaw` | none | One of the six. Echoed back as `"flaw"`, and an unrecognized value is a `400`, not an ignored parameter |
+| `client_id` | none | Which personas `persona=` may name. Absent behaves as a `client_id` nobody scoped to: the unscoped set |
 
 Body claims override persona claims, and override the registered claims too —
 `iss` and `exp` included — so you can mint a deliberately wrong token:
@@ -917,9 +1025,19 @@ curl -sX POST 'http://127.0.0.1:9500/_/api/token?persona=ada' \
      -H 'content-type: application/json' -d '{"iss":"http://evil.test"}'
 ```
 
-`GET /_/api/personas` lists what is loaded. An unknown persona, a body that is
-not a JSON object, or a non-numeric `ttl` returns `400` with
-`{"error", "error_description"}`.
+`GET /_/api/personas` lists what is loaded. **With `?client_id=`, the visible
+set; without it, everything** — every persona from every source, each row
+carrying the `client:` that actually applies to it and the `source` file it came
+from. A `warnings` array rides on both forms, so a test can assert on a broken
+project file without scraping HTML.
+
+```
+curl -s 'http://127.0.0.1:9500/_/api/personas?client_id=billing-web' | jq '[.personas[].id]'
+curl -s http://127.0.0.1:9500/_/api/personas | jq .warnings
+```
+
+An unknown persona, a body that is not a JSON object, or a non-numeric `ttl`
+returns `400` with `{"error", "error_description"}`.
 
 ## Troubleshooting
 
