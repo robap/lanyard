@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use lanyard_cli::app::{self, AppState};
 use lanyard_cli::config::Config;
+use lanyard_cli::events::EventBus;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::persona::Personas;
 use lanyard_cli::store::Stores;
@@ -46,17 +47,25 @@ pub async fn spawn_with(personas: Personas) -> String {
 }
 
 pub async fn spawn_configured(personas: Personas, stores: Stores) -> String {
+    spawn_observed(personas, stores).await.0
+}
+
+/// The server **and its event bus**, for the tests that assert on what was
+/// logged rather than on what was answered.
+pub async fn spawn_observed(personas: Personas, stores: Stores) -> (String, EventBus) {
     let config = Config::resolve(|key| match key {
         "HOME" => Some("/nonexistent".to_string()),
         _ => None,
     })
     .unwrap();
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
+    let events = EventBus::new();
     let state = Arc::new(AppState {
         config,
         key,
         personas,
         stores,
+        events: events.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -64,7 +73,107 @@ pub async fn spawn_configured(personas: Personas, stores: Stores) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app::router(state)).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), events)
+}
+
+/// The event bus alongside the URL, with the built-in personas.
+pub async fn spawn_logged() -> (String, EventBus) {
+    spawn_observed(Personas::builtin(), Stores::default()).await
+}
+
+/// A whole browser login, ending at the authorization code. The picker is
+/// driven exactly as a human drives it, so the code that comes back is a real
+/// one with a real record behind it.
+pub async fn login(base: &str, persona: &str, client_id: &str, scope: &str) -> String {
+    login_as(&client(), base, persona, client_id, scope).await
+}
+
+/// The same login driven by a caller's client, so the session cookie the pick
+/// sets stays with the browser the rest of the test is using.
+pub async fn login_as(
+    client: &reqwest::Client,
+    base: &str,
+    persona: &str,
+    client_id: &str,
+    scope: &str,
+) -> String {
+    let res = client
+        .get(format!(
+            "{base}/oidc/authorize?client_id={client_id}&redirect_uri={ADA_CB}\
+             &response_type=code&scope={}",
+            scope.replace(' ', "%20")
+        ))
+        .send()
+        .await
+        .unwrap();
+    let location = res.headers()["location"].to_str().unwrap().to_owned();
+
+    // A browser that already chose somebody for this `client_id` never sees the
+    // picker: `/authorize` completes on the remembered selection and redirects
+    // straight back to the RP. That is Phase 4's behaviour, not a special case
+    // — so a second login through this helper has to take it.
+    let location = match location.split("req=").nth(1) {
+        Some(req) => {
+            let res = client
+                .post(format!("{base}/_/pick"))
+                .form(&[("req", req), ("persona", persona)])
+                .send()
+                .await
+                .unwrap();
+            res.headers()["location"].to_str().unwrap().to_owned()
+        }
+        None => location,
+    };
+    url::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .expect("an authorization code")
+}
+
+/// Read from a held-open stream until `until` bytes' worth of frames have
+/// arrived or the deadline passes, then give back what was read.
+///
+/// The endpoint never ends its response, so a plain `.text()` would hang for
+/// ever: these assertions are about what arrives, not about a body.
+pub async fn read_stream(res: reqwest::Response, frames: usize) -> String {
+    read_stream_for(res, frames, std::time::Duration::from_secs(5)).await
+}
+
+/// The same, with the deadline named — for the assertions that expect **no**
+/// frames, where waiting out a generous timeout is the whole cost of the test.
+pub async fn read_stream_for(
+    res: reqwest::Response,
+    frames: usize,
+    within: std::time::Duration,
+) -> String {
+    use futures_util::StreamExt as _;
+
+    let mut body = res.bytes_stream();
+    let mut out = String::new();
+    let deadline = tokio::time::Instant::now() + within;
+    while complete_records(&out) < frames {
+        let chunk = tokio::time::timeout_at(deadline, body.next()).await;
+        match chunk {
+            Ok(Some(Ok(bytes))) => out.push_str(&String::from_utf8_lossy(&bytes)),
+            Ok(Some(Err(e))) => panic!("stream error: {e}"),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// How many whole records have arrived, counting either encoding: an SSE frame
+/// ends with a blank line, an ndjson record with one.
+fn complete_records(out: &str) -> usize {
+    out.matches("\n\n").count().max(out.matches("}\n").count())
+}
+
+/// Everything the bus has retained, in order.
+pub fn logged(events: &EventBus) -> Vec<lanyard_cli::events::Event> {
+    events.subscribe(None).0
 }
 
 /// A client that stops at the first response. Following a `302` to

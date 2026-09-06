@@ -125,6 +125,13 @@ impl Config {
     pub fn ui_url(&self) -> String {
         format!("{}/_/", self.issuer.trim_end_matches("/oidc"))
     }
+
+    /// The live request log. Derived from the issuer for `ui_url`'s reason, and
+    /// printed by the banner — which, since Phase 1, must never print a URL
+    /// that 404s.
+    pub fn log_url(&self) -> String {
+        format!("{}/_/log", self.issuer.trim_end_matches("/oidc"))
+    }
 }
 
 /// XDG by hand rather than via `directories`, which would return
@@ -184,6 +191,7 @@ mod tests {
         // The banner prints this and criterion 25 fetches it, so the `/oidc`
         // segment has to come back off.
         assert_eq!(c.ui_url(), "http://127.0.0.1:9500/_/");
+        assert_eq!(c.log_url(), "http://127.0.0.1:9500/_/log");
     }
 
     #[test]

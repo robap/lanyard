@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- To force a theme regardless of system preference, set data-theme="light" or data-theme="dark" on <html>. -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>lanyard — live request log</title>
+</head>
+<body>
+  <header class="log-header split align-center pad-md border-b">
+    <h1 class="text-h3">lanyard — live request log</h1>
+    <a class="text-small" href="/_/">persona picker</a>
+  </header>
+  <!--
+    With JavaScript off this page says so and names the surface that works
+    without it, rather than degrading to a static snapshot: a page that
+    silently stops updating is worse than one that says it needs a thing.
+  -->
+  <noscript>
+    <p class="noscript pad-md">
+      This page needs JavaScript. Without it, run <code>lanyard logs</code> in a
+      terminal — it prints the same events, and <code>lanyard logs --json</code>
+      prints them one JSON object per line.
+    </p>
+  </noscript>
+  <div id="app"></div>
+</body>
+</html>

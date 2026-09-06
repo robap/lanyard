@@ -1,0 +1,13 @@
+# Framework-owned cache (type defs, SCSS tokens, fonts, component lib).
+# Regenerated from ../zero.toml via `zero update -y`. Never hand-edit.
+# Anchored (leading slash) so it matches ONLY web/.zero — the framework cache —
+# and NOT web/dist/.zero, whose fonts are part of the committed built UI.
+/.zero/
+# NOTE: web/dist/ is intentionally NOT ignored. The built UI is a committed
+# artifact so lanyard builds with a Rust toolchain alone — `zero` is never on
+# the build path (north star 5). Regenerate it with `zero build` and commit the
+# result before pushing; there is no CI gate on freshness, by decision.
+# See docs/features/06-live-request-log-spec.md.
+# Test / mutation reports.
+coverage/
+mutation/

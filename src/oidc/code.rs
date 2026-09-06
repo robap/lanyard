@@ -55,16 +55,28 @@ impl Challenge {
     /// lets a broken PKCE implementation ship, and production is a bad place to
     /// find that out.
     pub fn verify(&self, verifier: &str) -> bool {
-        let presented = match self.method {
-            ChallengeMethod::Plain => verifier.to_string(),
-            ChallengeMethod::S256 => b64::encode(Sha256::digest(verifier.as_bytes())),
-        };
+        let presented = self.transform(verifier);
         // Not constant-time, on purpose and with a straight face: the challenge
         // is a public value the client just sent us, and the thing being
         // compared is single-use for 60 seconds on loopback. A timing-safe
         // compare here would be security theatre in a tool whose signing key is
         // published in its own repository.
         presented == self.value
+    }
+
+    /// What this challenge's method makes of a verifier — the value that is
+    /// compared against `self.value`.
+    ///
+    /// Public because **Phase 6's log shows the comparison rather than its
+    /// result**: the expanded row stacks the verifier presented, this
+    /// transformation of it, and the challenge recorded, and the developer
+    /// reads which two were meant to be equal. Computing that in the log would
+    /// be a second implementation of the one thing that must not have two.
+    pub fn transform(&self, verifier: &str) -> String {
+        match self.method {
+            ChallengeMethod::Plain => verifier.to_string(),
+            ChallengeMethod::S256 => b64::encode(Sha256::digest(verifier.as_bytes())),
+        }
     }
 }
 

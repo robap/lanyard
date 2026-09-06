@@ -62,6 +62,10 @@ pub struct MintRequest<'a> {
 /// What went wrong, in the three shapes a user can act on. `Display` is what
 /// they read on stderr, so each variant is written as a sentence rather than as
 /// a type name.
+///
+/// Shared by `token`/`env` and by `logs`: both are the CLI reaching a running
+/// lanyard over HTTP, and "nothing listening at …" is the same sentence and the
+/// same fix whichever subcommand hit it.
 #[derive(Debug)]
 pub enum MintError {
     /// Nothing is listening. By far the most common failure, and the one where
@@ -159,6 +163,90 @@ pub async fn mint(request: &MintRequest<'_>) -> Result<String, MintError> {
             None => Err(unexpected(request.url, status, &body)),
         },
         Err(_) => Err(unexpected(request.url, status, &body)),
+    }
+}
+
+/// `lanyard logs` — follow the running singleton's event stream and print it.
+///
+/// **Bare reads the SSE stream and renders it with [`crate::events::pretty`]**,
+/// the same function `lanyard serve` prints with, so a second terminal shows
+/// what the first is showing. `--json` reads `?format=ndjson` and passes each
+/// line through untouched, because the thing on the other end of that pipe is
+/// `jq` and re-encoding could only lose.
+///
+/// No lanyard running is an **error**, not an empty stream: a tool that exits
+/// `0` having printed nothing is a tool that lies about having looked.
+pub async fn logs(url: &str, json: bool) -> Result<(), MintError> {
+    let endpoint = match json {
+        true => format!("{url}/_/api/events?format=ndjson"),
+        false => format!("{url}/_/api/events"),
+    };
+
+    let mut response = reqwest::Client::new()
+        .get(&endpoint)
+        .send()
+        .await
+        .map_err(|e| transport_error(url, &e))?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.text().await.unwrap_or_default();
+        return Err(unexpected(url, status, &body));
+    }
+
+    // Framed by hand rather than through a line-oriented codec: a chunk is not
+    // a line, and a frame split across two reads has to survive the join.
+    let mut buffered = String::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| transport_error(url, &e))?
+    {
+        buffered.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffered.find('\n') {
+            let line: String = buffered.drain(..=end).collect();
+            print_line(line.trim_end_matches(['\r', '\n']), json);
+        }
+    }
+
+    // The stream only ends when the other end goes away. Reporting that is the
+    // same stance as refusing to start: a `logs` that returns quietly looks
+    // exactly like one that is still following.
+    Err(MintError::Transport {
+        url: url.to_string(),
+        message: "the event stream ended — lanyard stopped".to_string(),
+    })
+}
+
+/// One line off the wire, rendered for whichever surface asked.
+fn print_line(line: &str, json: bool) {
+    if json {
+        // Already one JSON object per line, markers included: `jq` gets to
+        // decide what a `{"dropped":N}` means to it.
+        if !line.is_empty() {
+            println!("{line}");
+        }
+        return;
+    }
+
+    // SSE: `id:` and blank lines carry no payload, and the payload is on
+    // `data:`.
+    let Some(payload) = line.strip_prefix("data: ") else {
+        return;
+    };
+    match serde_json::from_str::<crate::events::Event>(payload) {
+        Ok(event) => println!("{}", crate::events::pretty(&event)),
+        // Not an event: the clear directive, or a `dropped` marker on its own
+        // event type. A hole must be visible here too — that is the whole point
+        // of the marker.
+        Err(_) => {
+            if let Some(dropped) = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| v["dropped"].as_u64())
+            {
+                println!("-- dropped {dropped} events; this reader could not keep up --");
+            }
+        }
     }
 }
 

@@ -5,6 +5,26 @@ edition = "2021"
 description = "A local OIDC provider with nothing to configure"
 license = "MIT"
 repository = "https://github.com/robap/lanyard"
+# **`web/dist/` ships; nothing else under `web/` does.** The built UI is what
+# `rust-embed` compiles in, so a `cargo install` with no `zero` on PATH needs
+# it — and `cargo publish`'s verification build is the check that it is there.
+# The zero *sources*, the spikes and the docs are how the repository works, not
+# how the crate builds, and they are three quarters of the package by file
+# count. `exclude` rather than `include` so a new source file is shipped by
+# default and dropping one is the deliberate act.
+exclude = [
+    "/docs",
+    "/spikes",
+    "/scripts",
+    "/zero.toml",
+    "/web/src",
+    "/web/styles",
+    "/web/index.html",
+    "/web/tsconfig.json",
+    "/web/AGENTS.md",
+    "/web/.gitignore",
+    "/.claude",
+]
 
 [lib]
 name = "lanyard_cli"
@@ -40,7 +60,17 @@ serde_urlencoded = "0.7"
 # The CLI performs a real `client_credentials` grant rather than signing locally,
 # so `reqwest` is a runtime dependency now. `default-features = false` keeps a TLS
 # stack out of the binary: `LANYARD_URL` is http-only until HTTPS lands post-v1.
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "form"] }
+# `"stream"` is Phase 6's addition: `lanyard logs` reads a response body as it
+# arrives, and `Response::bytes_stream()` does not exist without it.
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "stream"] }
+# The committed `web/dist/` compiled into the binary. Reads from disk in debug
+# builds and embeds in release, so the UI loop is `zero build && cargo run` with
+# no second process — and `zero` is never on lanyard's build path.
+rust-embed = "8"
+# One `async_stream::stream!` builds the event stream's already-encoded frames,
+# so SSE and ndjson are two content types over one code path rather than two
+# paths that could drift about what they emit.
+async-stream = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -48,5 +78,6 @@ url = "2"
 sha2 = { version = "0.10", features = ["oid"] }
 # The browser-flow tests need a cookie jar, and the binary does not: the feature
 # is added here so `lanyard` itself never links a cookie store it has no use for.
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "cookies"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "cookies", "stream"] }
+futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

@@ -31,6 +31,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::log_detail::{attach, LogDetail};
 use crate::oidc::flaw::Flaw;
 use crate::oidc::issue::{self, DEFAULT_TTL, ID_TOKEN_TTL};
 use crate::oidc::scope::{ClaimFilter, Scopes, OFFLINE_ACCESS};
@@ -47,7 +48,28 @@ pub fn route() -> axum::routing::MethodRouter<SharedState> {
 
 async fn token(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
     let form = Form::parse(&body);
+    let response = dispatch(&state, &headers, &form);
 
+    // **The envelope, added on the way out.** The arms have already attached
+    // whatever only they knew — the reason for a refusal, the client off a code
+    // record, the tokens that were minted — and [`LogDetail`]'s first-writer-
+    // wins merge means none of it is disturbed by this.
+    attach(
+        response,
+        LogDetail {
+            client_id: form
+                .get("client_id")
+                .map(str::to_string)
+                .or_else(|| basic_client_id(&headers)),
+            grant_type: form.get("grant_type").map(str::to_string),
+            request: Some(crate::log_detail::request_map(form.pairs())),
+            flaw: form.get("flaw").map(str::to_string),
+            ..LogDetail::default()
+        },
+    )
+}
+
+fn dispatch(state: &SharedState, headers: &HeaderMap, form: &Form) -> Response {
     // An empty `grant_type=` is the same mistake as no `grant_type` at all, and
     // both are `invalid_request` rather than `unsupported_grant_type`: nothing
     // was named, so nothing can be unsupported.
@@ -56,9 +78,9 @@ async fn token(State(state): State<SharedState>, headers: HeaderMap, body: Bytes
             "invalid_request",
             format!("grant_type is required; this build supports {SUPPORTED}"),
         ),
-        Some("client_credentials") => client_credentials(&state, &headers, &form),
-        Some("authorization_code") => authorization_code(&state, &form),
-        Some("refresh_token") => refresh_token(&state, &form),
+        Some("client_credentials") => client_credentials(state, headers, form),
+        Some("authorization_code") => authorization_code(state, form),
+        Some("refresh_token") => refresh_token(state, form),
         Some(other) => bad_request(
             "unsupported_grant_type",
             format!("grant_type {other:?} is not supported; this build supports {SUPPORTED}"),
@@ -155,13 +177,25 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
             if let Some(scope) = scope {
                 body["scope"] = Value::from(scope);
             }
-            ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+            let response = ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response();
+            attach(response, minted(&[("access_token", &issued.token)]))
         }
-        Err(message) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "issuance_failed", "error_description": message })),
-        )
-            .into_response(),
+        Err(message) => issuance_failed(message),
+    }
+}
+
+/// The `issued` payload: the decoded header and payload of every token that
+/// came out, keyed by the response field it was returned as.
+fn minted(tokens: &[(&str, &str)]) -> LogDetail {
+    let mut issued = Map::new();
+    for (name, jwt) in tokens {
+        if let Some(decoded) = crate::log_detail::decoded_token(jwt) {
+            issued.insert((*name).to_string(), decoded);
+        }
+    }
+    LogDetail {
+        issued: Some(issued),
+        ..LogDetail::default()
     }
 }
 
@@ -218,11 +252,14 @@ fn authorization_code(state: &SharedState, form: &Form) -> Response {
             .map(|url| url == record.request.redirect_uri)
             .unwrap_or(false);
         if !matches {
-            return invalid_grant(&format!(
-                "redirect_uri {presented:?} does not match the one this code was \
-                 issued against, {:?}",
-                record.request.redirect_uri.as_str()
-            ));
+            return invalid_grant_for(
+                &record.request.client_id,
+                &format!(
+                    "redirect_uri {presented:?} does not match the one this code was \
+                     issued against, {:?}",
+                    record.request.redirect_uri.as_str()
+                ),
+            );
         }
     }
 
@@ -233,18 +270,47 @@ fn authorization_code(state: &SharedState, form: &Form) -> Response {
     // a broken PKCE implementation ship.
     if let Some(challenge) = &record.request.challenge {
         let Some(verifier) = form.get("code_verifier") else {
-            return invalid_grant(&format!(
-                "this code was issued against a {} code_challenge, so a \
-                 code_verifier is required",
-                challenge.method.as_str()
-            ));
+            return invalid_grant_for(
+                &record.request.client_id,
+                &format!(
+                    "this code was issued against a {} code_challenge, so a \
+                     code_verifier is required",
+                    challenge.method.as_str()
+                ),
+            );
         };
         if !challenge.verify(verifier) {
-            return invalid_grant(&format!(
-                "the code_verifier does not match the {} code_challenge this code \
-                 was issued against",
-                challenge.method.as_str()
-            ));
+            // **The three values, side by side.** The sentence says which
+            // parameter is wrong; this says *how* — and the recorded and
+            // computed challenges differ visibly at the character the typo is
+            // in. That is criterion 10, and it is the reason this phase exists.
+            let response = invalid_grant_for(
+                &record.request.client_id,
+                &format!(
+                    "the code_verifier does not match the {} code_challenge this code \
+                     was issued against",
+                    challenge.method.as_str()
+                ),
+            );
+            return attach(
+                response,
+                LogDetail {
+                    detail: Some(
+                        json!({
+                            "pkce": {
+                                "method": challenge.method.as_str(),
+                                "verifier_presented": verifier,
+                                "challenge_computed": challenge.transform(verifier),
+                                "challenge_recorded": challenge.value,
+                            }
+                        })
+                        .as_object()
+                        .cloned()
+                        .expect("a JSON object literal"),
+                    ),
+                    ..LogDetail::default()
+                },
+            );
         }
     }
     // A `code_verifier` sent when no challenge was recorded is ignored, exactly
@@ -360,7 +426,24 @@ fn authorization_code(state: &SharedState, form: &Form) -> Response {
         &access,
     );
 
-    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+    // **The `client_id` comes off the code record, not off a form field.** RFC
+    // 6749 does not require an RP to resend it on the exchange, and several do
+    // not — reading the form here would leave the exchange half of a login
+    // unlabelled in a log whose whole readability rests on that column.
+    let mut detail = minted_pair(&access.token, body.get("id_token").and_then(Value::as_str));
+    detail.client_id = Some(request.client_id.clone());
+    attach(
+        ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response(),
+        detail,
+    )
+}
+
+/// An access token and, when `openid` was asked for, the ID token beside it.
+fn minted_pair(access: &str, id_token: Option<&str>) -> LogDetail {
+    match id_token {
+        Some(id_token) => minted(&[("access_token", access), ("id_token", id_token)]),
+        None => minted(&[("access_token", access)]),
+    }
 }
 
 /// Note what a browser session was just issued, so **Expire now** has something
@@ -553,6 +636,11 @@ fn refresh_token(state: &SharedState, form: &Form) -> Response {
     };
     body["refresh_token"] = Value::from(rotated);
 
+    let mut detail = minted_pair(&access.token, body.get("id_token").and_then(Value::as_str));
+    // As on the code arm: the client comes off the stored grant. A refresh is
+    // the request least likely to name itself.
+    detail.client_id = Some(record.client_id.clone());
+
     record_issuance(
         state,
         record.session_id.as_deref(),
@@ -560,7 +648,10 @@ fn refresh_token(state: &SharedState, form: &Form) -> Response {
         &access,
     );
 
-    ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response()
+    attach(
+        ([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response(),
+        detail,
+    )
 }
 
 /// What both user-facing grants have in common: who authenticated, for which
@@ -634,12 +725,40 @@ fn invalid_grant(description: &str) -> Response {
     bad_request("invalid_grant", description.to_string())
 }
 
-fn issuance_failed(message: String) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": "issuance_failed", "error_description": message })),
+/// The same refusal, **labelled with the application it was for**.
+///
+/// Once a code record has been taken, lanyard knows whose login just failed
+/// even though the exchange form never said — and "`client_id` on every event,
+/// always" is what makes the log readable when three projects are running at
+/// once. A refusal that dropped the label would be the one row a developer
+/// could not attribute, on the page they opened to attribute it.
+fn invalid_grant_for(client_id: &str, description: &str) -> Response {
+    attach(
+        invalid_grant(description),
+        LogDetail {
+            client_id: Some(client_id.to_string()),
+            ..LogDetail::default()
+        },
     )
-        .into_response()
+}
+
+/// The other way out that is not a success. Logged for `bad_request`'s reason:
+/// an error nobody can see is the failure this phase exists to end, and a `500`
+/// is the one a developer is least equipped to guess at.
+fn issuance_failed(message: String) -> Response {
+    let response = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "issuance_failed", "error_description": message.clone() })),
+    )
+        .into_response();
+    attach(
+        response,
+        LogDetail {
+            error: Some("issuance_failed".to_string()),
+            error_description: Some(message),
+            ..LogDetail::default()
+        },
+    )
 }
 
 /// The username half of `Authorization: Basic`, which RFC 6749 §2.3.1 defines as
@@ -672,12 +791,26 @@ fn form_decode(raw: &str) -> String {
 }
 
 /// `400` in the OAuth error shape the seam already uses.
+///
+/// **This is the funnel every refusal on this endpoint passes through**, so
+/// attaching the error here is what makes Phase 6's "no error can be returned
+/// without being logged" a property of the code rather than a habit. The four
+/// arms above add the `client_id` and the parameters on the way out; this adds
+/// the reason, and [`LogDetail`]'s first-writer-wins merge keeps them apart.
 fn bad_request(error: &str, description: String) -> Response {
-    (
+    let response = (
         StatusCode::BAD_REQUEST,
-        Json(json!({ "error": error, "error_description": description })),
+        Json(json!({ "error": error, "error_description": description.clone() })),
     )
-        .into_response()
+        .into_response();
+    attach(
+        response,
+        LogDetail {
+            error: Some(error.to_string()),
+            error_description: Some(description),
+            ..LogDetail::default()
+        },
+    )
 }
 
 /// The decoded form, kept as ordered pairs so a repeated parameter resolves to
@@ -690,6 +823,13 @@ fn bad_request(error: &str, description: String) -> Response {
 pub(crate) struct Form(Vec<(String, String)>);
 
 impl Form {
+    /// The decoded pairs, for the log. `/oidc/authorize` reads this too — the
+    /// event's `request` is the parameters the handler acted on, so it comes
+    /// off the same parse rather than off a second one.
+    pub(crate) fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
     /// Infallible, and that is an observed fact rather than an assumption:
     /// `serde_urlencoded` decoding into pairs is lossy on invalid UTF-8 and
     /// lenient about stray `%` escapes, so no byte string fails. A body that is

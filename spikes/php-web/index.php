@@ -100,6 +100,21 @@ if ($path === '/secure' || $isCallback) {
         $_SESSION['id_token'] = $oidc->getIdToken();
         // Three calls to GET /oidc/userinfo with a bearer token, server to
         // server. This is the thing this spike is evidence of.
+        //
+        // **Three calls means three HTTP requests, and `/_/log` will show all
+        // three.** `requestUserInfo($attribute)` fetches the whole UserInfo
+        // document and then picks one field off it, with no memoization
+        // anywhere in the client — so asking for three claims is three round
+        // trips, not one response read three ways. `dotnet-web` produces a
+        // single `/oidc/userinfo` line for the same login, because ASP.NET's
+        // `GetClaimsFromUserInfoEndpoint` fetches once and maps every claim.
+        //
+        // Left as three deliberately: the noise is the point. A per-attribute
+        // getter that looks free and is not is exactly the sort of thing a
+        // spike against a real SDK exists to make visible, and it is invisible
+        // until something prints a line per request. `$oidc->requestUserInfo()`
+        // with no argument returns the whole object in one call, which is what
+        // an application should do.
         $_SESSION['user'] = [
             'email' => $oidc->requestUserInfo('email'),
             'name'  => $oidc->requestUserInfo('name'),

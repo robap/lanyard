@@ -18,6 +18,7 @@ use axum::Json;
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::log_detail::{attach, LogDetail};
 use crate::oidc::issue::persona_claims;
 use crate::oidc::jws;
 use crate::oidc::scope::{ClaimFilter, Scopes};
@@ -91,11 +92,28 @@ async fn userinfo(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         None => filtered_from_token(&claims, &filter),
     };
 
-    (
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(Value::Object(body)),
+    // Who asked, and who they got. `client_id` comes off the token because that
+    // is the only thing this request carries about the application — a
+    // `/userinfo` call names itself nowhere else.
+    attach(
+        (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(Value::Object(body)),
+        )
+            .into_response(),
+        LogDetail {
+            client_id: claims
+                .get("client_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            detail: Some(
+                [("sub".to_string(), Value::from(sub))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..LogDetail::default()
+        },
     )
-        .into_response()
 }
 
 fn filtered_from_token(claims: &Map<String, Value>, filter: &ClaimFilter) -> Map<String, Value> {
@@ -134,7 +152,7 @@ fn unauthorized(description: &str) -> Response {
         // quote inside a quoted-string would produce a header no client parses.
         description.replace('"', "'")
     );
-    (
+    let response = (
         StatusCode::UNAUTHORIZED,
         [
             (header::WWW_AUTHENTICATE, challenge.as_str()),
@@ -142,7 +160,15 @@ fn unauthorized(description: &str) -> Response {
         ],
         Json(json!({ "error": "invalid_token", "error_description": description })),
     )
-        .into_response()
+        .into_response();
+    attach(
+        response,
+        LogDetail {
+            error: Some("invalid_token".to_string()),
+            error_description: Some(description.to_string()),
+            ..LogDetail::default()
+        },
+    )
 }
 
 #[cfg(test)]

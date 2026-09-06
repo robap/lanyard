@@ -12,6 +12,9 @@ pub struct Banner<'a> {
     /// banner must not print a URL that 404s; Phase 4 is the phase where it
     /// stops doing that.
     pub ui: &'a str,
+    /// The live request log. Same rule as `ui`: Phase 1 deferred a line the
+    /// page for which did not exist yet, and this is the phase where it does.
+    pub log: &'a str,
     pub listen: &'a str,
     pub data_dir: &'a str,
     pub kid: &'a str,
@@ -23,6 +26,7 @@ pub fn render(b: &Banner) -> String {
         "lanyard {}\n  \
          Issuer    → {}\n  \
          UI        → {}\n  \
+         Log       → {}\n  \
          Listening → {}\n  \
          Data dir  → {}\n  \
          Signing   → kid {}\n  \
@@ -30,6 +34,7 @@ pub fn render(b: &Banner) -> String {
         env!("CARGO_PKG_VERSION"),
         b.issuer,
         b.ui,
+        b.log,
         b.listen,
         b.data_dir,
         b.kid,
@@ -59,6 +64,7 @@ mod tests {
         render(&Banner {
             issuer: "http://lanyard:9500/oidc",
             ui: "http://lanyard:9500/_/",
+            log: "http://lanyard:9500/_/log",
             listen: "0.0.0.0:9500",
             data_dir: "/tmp/lanyard-data",
             kid: "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs",
@@ -87,6 +93,7 @@ mod tests {
         let out = sample();
         assert!(line_with(&out, "Listening").contains("0.0.0.0:9500"));
         assert!(line_with(&out, "UI").ends_with("http://lanyard:9500/_/"));
+        assert!(line_with(&out, "Log").ends_with("http://lanyard:9500/_/log"));
         assert!(line_with(&out, "Data dir").contains("/tmp/lanyard-data"));
         assert!(line_with(&out, "Signing").contains("NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"));
     }

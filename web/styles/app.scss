@@ -1,0 +1,279 @@
+@use '../.zero/styles/zero';
+
+// lanyard's own rules. Everything structural comes from zero's layout
+// primitives and utilities in the markup; what is left here is the handful of
+// things a primitive cannot say — table geometry, the persona button's
+// affordance, and the colour a status pill takes.
+//
+// **One stylesheet for four pages.** The server-rendered picker, mint panel,
+// session controls and rejection page are styled here alongside `/_/log`, so
+// there is one visual language rather than a design system beside a
+// hand-written imitation of one.
+
+// ---------------------------------------------------------- shared shell --
+
+.page {
+  max-width: 48rem;
+  margin: 0 auto;
+}
+
+.lede {
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+footer {
+  color: var(--color-text-subtle);
+  border-top: var(--border-thin) solid var(--color-border);
+  padding-top: var(--space-md);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+h1, h2, h3 { margin: 0; }
+p { margin: 0; }
+
+a { color: var(--color-primary); }
+
+.card {
+  background: var(--color-surface);
+  border-radius: var(--radius-lg);
+}
+
+// The one rejection has one look, on both pages that render it.
+//
+// **The text colour is the solid token, not `-fg`.** `--color-danger-fg` is the
+// foreground for text sitting *on* `--color-danger` — white in the light theme,
+// near-black in the dark one — so pairing it with `-soft` is unreadable in both.
+// On a soft background the solid token is the readable one, in both themes.
+.warn {
+  background: var(--color-danger-soft);
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.none { color: var(--color-text-subtle); }
+
+// ---------------------------------------------------------- the picker --
+
+// A persona is a button the size of a card: the list *is* the authentication,
+// so picking a person has to look like the primary action on the page.
+.persona { margin: 0; }
+
+.persona-btn {
+  width: 100%;
+  background: var(--color-surface);
+  color: var(--color-text);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+}
+
+.persona-btn:hover {
+  background: var(--color-primary-soft);
+  border-color: var(--color-primary);
+}
+
+.email, .roles { color: var(--color-text-muted); }
+.id { color: var(--color-text-subtle); }
+
+.mint input,
+.mint textarea {
+  width: 100%;
+  padding: var(--space-sm);
+  border: var(--border-thin) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.mint textarea { min-height: 5rem; }
+.mint label { color: var(--color-text-muted); font-size: var(--font-size-sm); }
+
+.submit {
+  padding: var(--space-sm) var(--space-md);
+  border: var(--border-thin) solid var(--color-primary);
+  border-radius: var(--radius-md);
+  background: var(--color-primary);
+  color: var(--color-primary-fg);
+  font: inherit;
+  cursor: pointer;
+}
+
+.submit:hover { background: var(--color-primary-hover); }
+
+.submit.danger {
+  background: var(--color-danger);
+  border-color: var(--color-danger);
+  color: var(--color-danger-fg);
+}
+
+.submit.danger:hover { background: var(--color-danger-hover); }
+
+// **Forget** and **Expire now** sit inside the row they act on, so they are
+// quiet buttons rather than a second primary action.
+.row form { margin: 0; }
+
+.row button {
+  padding: var(--space-xs) var(--space-sm);
+  border: var(--border-thin) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.row button:hover { border-color: var(--color-border-strong); }
+.row .name { flex: 1; }
+.row .when { color: var(--color-text-subtle); }
+
+.check label { color: var(--color-text-muted); }
+
+// ------------------------------------------------------------- the log --
+
+.log-header {
+  background: var(--color-surface);
+}
+
+.noscript {
+  background: var(--color-warning-soft);
+  color: var(--color-text);
+}
+
+.log-screen { height: calc(100vh - 4rem); }
+
+.toolbar { background: var(--color-surface); }
+
+.count { color: var(--color-text-subtle); }
+
+.clear-btn,
+.pause-btn {
+  border-radius: var(--radius-md);
+  background: var(--color-surface-strong);
+  color: var(--color-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pause-count {
+  margin-left: var(--space-xs);
+  padding: 0 var(--space-xs);
+  border-radius: var(--radius-3xl);
+  background: var(--color-primary);
+  color: var(--color-primary-fg);
+  font-size: var(--font-size-sm);
+}
+
+.log-wrap {
+  overflow: auto;
+  flex: 1;
+}
+
+.log-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+}
+
+.log-table th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg);
+  color: var(--color-text-subtle);
+  font-size: var(--font-size-sm);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-caps);
+  padding: var(--space-xs) var(--space-sm);
+  border-bottom: var(--border-thin) solid var(--color-border);
+}
+
+.log-table td {
+  padding: var(--space-xs) var(--space-sm);
+  border-bottom: var(--border-thin) solid var(--color-border);
+  vertical-align: top;
+}
+
+.log-row { cursor: pointer; }
+.log-row:hover td { background: var(--color-surface); }
+
+.c-time, .c-dur, .c-endpoint, .c-client { font-family: var(--font-mono); }
+.c-time, .c-dur { color: var(--color-text-subtle); white-space: nowrap; }
+
+// The sentence Phases 4 and 5 wrote is the widest thing on the row, and it is
+// the point — it wraps rather than being clipped.
+.c-detail { color: var(--color-text-muted); }
+
+.method {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semi);
+  color: var(--color-text-muted);
+}
+
+.pill {
+  display: inline-block;
+  padding: 0 var(--space-xs);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+
+// Soft background, solid foreground — see `.warn`. Amber takes its `-hover`
+// shade instead, which is the darker step in the light theme and the lighter
+// one in the dark theme, because amber at full strength is the one hue that is
+// legible against neither of its own soft backgrounds.
+.pill.s-ok       { background: var(--color-success-soft); color: var(--color-success); }
+.pill.s-redirect { background: var(--color-primary-soft); color: var(--color-primary); }
+.pill.s-warn     { background: var(--color-warning-soft); color: var(--color-warning-hover); }
+.pill.s-error    { background: var(--color-danger-soft);  color: var(--color-danger); }
+
+.empty-state { color: var(--color-text-subtle); }
+
+// --------------------------------------------------- the expanded panel --
+
+.detail-cell { background: var(--color-surface); }
+
+.claims pre,
+.request-json {
+  flex: 1;
+  min-width: 16rem;
+  margin: 0;
+  padding: var(--space-sm);
+  overflow: auto;
+  background: var(--color-bg);
+  border: var(--border-thin) solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+// The three values, stacked so the pair that was meant to be equal reads as a
+// pair. Monospace and unwrapped: a base64url string differing at character
+// three is only legible when the characters line up.
+.pkce-panel {
+  padding: var(--space-sm);
+  border: var(--border-thin) solid var(--color-warning);
+  border-radius: var(--radius-md);
+  background: var(--color-warning-soft);
+  color: var(--color-text);
+}
+
+.pkce-label {
+  min-width: 14rem;
+  color: var(--color-text-muted);
+}
+
+.pkce-value {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.expiry { color: var(--color-text-muted); }
+.expiry-epoch { font-family: var(--font-mono); }
+
+.expiry.expired .expiry-state {
+  color: var(--color-danger);
+  font-weight: var(--weight-semi);
+}

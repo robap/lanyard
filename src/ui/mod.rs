@@ -73,7 +73,8 @@ pub async fn picker(
             html::page(
                 "lanyard — that login is no longer in progress",
                 &format!(
-                    "<div class=\"warn\">\n<h1>That login is no longer in progress</h1>\n\
+                    "<div class=\"warn card stack gap-sm pad-lg border\">\n\
+                     <h1 class=\"text-h2\">That login is no longer in progress</h1>\n\
                      <p>An authorization request is held for five minutes, and lanyard \
                      holds them in memory, so either the five minutes ran out or lanyard \
                      was restarted. Start the login again from your application.</p>\n</div>\n{}",
@@ -104,14 +105,14 @@ fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browse
 
     match req {
         Some((_, client_id)) => out.push_str(&format!(
-            "<h1>Who are you signing in as?</h1>\n\
-             <p class=\"lede\"><code>{}</code> is waiting. There is no password — \
+            "<h1 class=\"text-h2\">Who are you signing in as?</h1>\n\
+             <p class=\"lede text-body\"><code>{}</code> is waiting. There is no password — \
              pick a person.</p>\n",
             html::escape(client_id)
         )),
         None => out.push_str(
-            "<h1>Personas</h1>\n\
-             <p class=\"lede\">No login is in progress. These are the people lanyard \
+            "<h1 class=\"text-h2\">Personas</h1>\n\
+             <p class=\"lede text-body\">No login is in progress. These are the people lanyard \
              can sign you in as; start a login from your application to pick one.</p>\n",
         ),
     }
@@ -123,8 +124,8 @@ fn persona_list(state: &SharedState, req: Option<(&str, &str)>, browser: &Browse
     out.push_str(&mint_panel(req.map(|(id, _)| id)));
     out.push_str(&this_browser_panel(state, req.map(|(id, _)| id), browser));
     out.push_str(
-        "<footer>lanyard · sessions live in memory, so restarting lanyard logs \
-         everybody out.</footer>\n",
+        "<footer class=\"text-small\">lanyard · sessions live in memory, so restarting \
+         lanyard logs everybody out. · <a href=\"/_/log\">live log</a></footer>\n",
     );
     out
 }
@@ -135,23 +136,26 @@ fn persona_row(persona: &Persona, req: Option<&str>) -> String {
     // that executes its own persona list is a bad look for a tool whose pitch
     // is "it catches your bugs" (criterion 27).
     let name = match &persona.name {
-        Some(name) => format!("<span class=\"name\">{}</span>", html::escape(name)),
-        None => "<span class=\"name none\">(no name)</span>".to_string(),
+        Some(name) => format!("<span class=\"name text-h4\">{}</span>", html::escape(name)),
+        None => "<span class=\"name none text-h4\">(no name)</span>".to_string(),
     };
     let email = match &persona.email {
-        Some(email) => format!("<span class=\"email\">{}</span>", html::escape(email)),
-        None => "<span class=\"email none\">(no email)</span>".to_string(),
+        Some(email) => format!(
+            "<span class=\"email text-small\">{}</span>",
+            html::escape(email)
+        ),
+        None => "<span class=\"email none text-small\">(no email)</span>".to_string(),
     };
     let roles = if persona.roles.is_empty() {
-        "<span class=\"roles none\">(no roles)</span>".to_string()
+        "<span class=\"roles none text-small\">(no roles)</span>".to_string()
     } else {
         format!(
-            "<span class=\"roles\">{}</span>",
+            "<span class=\"roles text-small\">{}</span>",
             html::escape(&persona.roles.join(", "))
         )
     };
     let inner = format!(
-        "{name}\n<span class=\"id\">{}</span>\n{email}\n{roles}\n",
+        "{name}\n<span class=\"id text-code text-small\">{}</span>\n{email}\n{roles}\n",
         html::escape(&persona.id)
     );
 
@@ -160,11 +164,13 @@ fn persona_row(persona: &Persona, req: Option<&str>) -> String {
             "<form class=\"persona\" method=\"post\" action=\"/_/pick\">\n\
              <input type=\"hidden\" name=\"req\" value=\"{}\">\n\
              <input type=\"hidden\" name=\"persona\" value=\"{}\">\n\
-             <button type=\"submit\">\n{inner}</button>\n</form>\n",
+             <button class=\"persona-btn stack gap-xs pad-md border text-start\" \
+             type=\"submit\">\n\
+             {inner}</button>\n</form>\n",
             html::escape(req),
             html::escape(&persona.id),
         ),
-        None => format!("<div class=\"card persona\">\n{inner}</div>\n"),
+        None => format!("<div class=\"card persona stack gap-xs pad-md border\">\n{inner}</div>\n"),
     }
 }
 
@@ -176,8 +182,9 @@ fn mint_panel(req: Option<&str>) -> String {
         return String::new();
     };
     format!(
-        "<h2>Or mint one now</h2>\n\
-         <form class=\"card\" method=\"post\" action=\"/_/pick\">\n\
+        "<h2 class=\"text-eyebrow\">Or mint one now</h2>\n\
+         <form class=\"card mint stack gap-xs pad-md border\" method=\"post\" \
+         action=\"/_/pick\">\n\
          <input type=\"hidden\" name=\"req\" value=\"{}\">\n\
          <label for=\"m-sub\">sub</label>\
          <input id=\"m-sub\" type=\"text\" name=\"sub\" placeholder=\"zed\" required>\n\
@@ -190,9 +197,10 @@ fn mint_panel(req: Option<&str>) -> String {
          <label for=\"m-attrs\">extra claims, as JSON</label>\
          <textarea id=\"m-attrs\" name=\"attributes\" \
          placeholder='{{\"department\": \"ops\"}}'></textarea>\n\
-         <button class=\"submit\" type=\"submit\">Sign in as this person</button>\n\
-         <p class=\"lede\">A one-off is not remembered: the next login from this \
-         application shows this page again.</p>\n\
+         <button class=\"submit align-self-start\" type=\"submit\">Sign in as this \
+         person</button>\n\
+         <p class=\"lede text-small\">A one-off is not remembered: the next login from \
+         this application shows this page again.</p>\n\
          </form>\n",
         html::escape(req),
     )
@@ -233,11 +241,11 @@ impl Browser {
 /// the question "who does this browser think I am" is the one a developer opens
 /// this page to answer, and a login in progress is not a reason to hide it.
 fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser) -> String {
-    let mut out = String::from("<h2>This browser</h2>\n");
+    let mut out = String::from("<h2 class=\"text-eyebrow\">This browser</h2>\n");
 
     if browser.signed_in.is_empty() {
         out.push_str(
-            "<p class=\"lede\">This browser is not signed in to any application. \
+            "<p class=\"lede text-body\">This browser is not signed in to any application. \
              Start a login and pick somebody, and it will be listed here.</p>\n",
         );
     }
@@ -249,10 +257,12 @@ fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser)
     // refresh token it was issued. Offered even with nothing listed, because a
     // browser can hold a session record with no selection in it.
     out.push_str(&format!(
-        "<form class=\"card\" method=\"post\" action=\"/_/logout\">\n{}\
-         <button class=\"submit danger\" type=\"submit\">Log out of lanyard</button>\n\
-         <p class=\"lede\">Every application, not just one. Each application still \
-         holds its own session cookie, and only that application can clear \
+        "<form class=\"card stack gap-sm pad-md border\" method=\"post\" \
+         action=\"/_/logout\">\n{}\
+         <button class=\"submit danger align-self-start\" type=\"submit\">Log out of \
+         lanyard</button>\n\
+         <p class=\"lede text-small\">Every application, not just one. Each application \
+         still holds its own session cookie, and only that application can clear \
          that.</p>\n</form>\n",
         back_field(req)
     ));
@@ -263,12 +273,14 @@ fn this_browser_panel(state: &SharedState, req: Option<&str>, browser: &Browser)
     let checked = if browser.always_ask { " checked" } else { "" };
     let back = back_field(req);
     out.push_str(&format!(
-        "<form class=\"card\" method=\"post\" action=\"/_/session\">\n{back}\
-         <div class=\"check\">\
+        "<form class=\"card stack gap-sm pad-md border\" method=\"post\" \
+         action=\"/_/session\">\n{back}\
+         <div class=\"check cluster gap-sm align-start\">\
          <input id=\"always-ask\" type=\"checkbox\" name=\"always_ask\" value=\"1\"{checked}>\
          <label for=\"always-ask\">Always ask which person, even when this browser \
          already chose one for an application</label></div>\n\
-         <button class=\"submit\" type=\"submit\">Save</button>\n</form>\n"
+         <button class=\"submit align-self-start\" type=\"submit\">Save</button>\n\
+         </form>\n"
     ));
     out
 }
@@ -299,10 +311,10 @@ fn signed_in_row(
     // available: one drops the person and shows the picker next time, the other
     // kills the tokens and keeps the person, so the app's own renew path runs.
     format!(
-        "<div class=\"card row\">\n\
+        "<div class=\"card row cluster align-center gap-md pad-md border\">\n\
          <span class=\"client\"><code>{client}</code></span>\n\
          <span class=\"name\">{who}</span>\n\
-         <span class=\"when\">chosen {when}</span>\n\
+         <span class=\"when text-small\">chosen {when}</span>\n\
          <form method=\"post\" action=\"/_/forget\">{back}\
          <input type=\"hidden\" name=\"client_id\" value=\"{client}\">\n\
          <button type=\"submit\" title=\"Drop this application&#39;s persona, so its \
@@ -389,7 +401,8 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
                     html::page(
                         "lanyard — no such persona",
                         &format!(
-                            "<div class=\"warn\"><h1>No persona with id <code>{}</code> \
+                            "<div class=\"warn card stack gap-sm pad-lg border\">\
+                             <h1 class=\"text-h2\">No persona with id <code>{}</code> \
                              is loaded</h1></div>\n",
                             html::escape(id)
                         ),
@@ -405,7 +418,8 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
                     html::page(
                         "lanyard — that person could not be minted",
                         &format!(
-                            "<div class=\"warn\"><h1>{}</h1></div>\n",
+                            "<div class=\"warn card stack gap-sm pad-lg border\">\
+                             <h1 class=\"text-h2\">{}</h1></div>\n",
                             html::escape(&message)
                         ),
                     ),
@@ -487,7 +501,8 @@ fn expired_page(state: &SharedState, browser: &Browser) -> Response {
         html::page(
             "lanyard — that login is no longer in progress",
             &format!(
-                "<div class=\"warn\">\n<h1>That login is no longer in progress</h1>\n\
+                "<div class=\"warn card stack gap-sm pad-lg border\">\n\
+                 <h1 class=\"text-h2\">That login is no longer in progress</h1>\n\
                  <p>The request was already answered, or its five minutes ran out, or \
                  lanyard was restarted. Start the login again from your \
                  application.</p>\n</div>\n{}",

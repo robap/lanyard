@@ -28,6 +28,19 @@ enum Command {
     Token(MintArgs),
     /// Print `export BEARER_TOKEN=...` for `eval`
     Env(MintArgs),
+    /// Follow the live request log of a running lanyard
+    Logs(LogsArgs),
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    /// One JSON object per event, for `jq`. Bare prints what `lanyard serve` prints
+    #[arg(long)]
+    json: bool,
+
+    /// Where lanyard is listening. An address, not the issuer
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
 }
 
 #[derive(Args)]
@@ -111,6 +124,9 @@ async fn main() -> ExitCode {
         Command::Env(args) => mint(&args)
             .await
             .map(|token| println!("export BEARER_TOKEN='{token}'")),
+        // Prints for as long as it runs and only ever returns an error: the
+        // stream ends when lanyard stops, and saying so beats exiting quietly.
+        Command::Logs(args) => follow(&args).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -138,6 +154,15 @@ async fn mint(args: &MintArgs) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
+/// The fourth subcommand, and the second thing the CLI does over HTTP against
+/// the running singleton rather than in-process.
+async fn follow(args: &LogsArgs) -> Result<(), String> {
+    let url = client::resolve_url(args.url.as_deref(), |key| std::env::var(key).ok())?;
+    client::logs(&url, args.json)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 async fn serve() -> Result<(), String> {
     let config = Config::from_env()?;
 
@@ -156,6 +181,7 @@ async fn serve() -> Result<(), String> {
         banner::render(&banner::Banner {
             issuer: &config.issuer,
             ui: &config.ui_url(),
+            log: &config.log_url(),
             listen: &addr,
             data_dir: &config.data_dir.display().to_string(),
             kid: key.kid(),
@@ -168,6 +194,7 @@ async fn serve() -> Result<(), String> {
         key,
         personas,
         stores: Stores::default(),
+        events: lanyard_cli::events::EventBus::new(),
     });
 
     axum::serve(listener, app::router(state))

@@ -57,6 +57,7 @@ cargo build --release
 lanyard 0.1.0
   Issuer    → http://127.0.0.1:9500/oidc
   UI        → http://127.0.0.1:9500/_/
+  Log       → http://127.0.0.1:9500/_/log
   Listening → 127.0.0.1:9500
   Data dir  → /home/you/.local/share/lanyard
   Signing   → kid TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU
@@ -70,6 +71,30 @@ rest on its own:
 curl -s http://127.0.0.1:9500/oidc/.well-known/openid-configuration | jq .
 curl -s http://127.0.0.1:9500/oidc/jwks | jq .
 ```
+
+**A Rust toolchain is the whole build.** No `node`, no `npm`, no bundler — the
+binary is the whole website. The one page that ships JavaScript, `/_/log`, is a
+[zero](https://github.com/robap/zero) app whose built output lives in `web/dist/`
+and is **committed**; `rust-embed` compiles it in. `zero` itself is a
+cargo-installed Rust binary and is needed only to *change* the UI:
+
+```
+cargo install zero --locked
+zero update -y && zero test && zero lint
+zero build            # regenerates web/dist/ — commit it
+```
+
+There is no CI gate on whether `web/dist/` is current: pinning CI to one `zero`
+version so a byte-identical rebuild could be compared would turn a routine
+framework bump into a red build, and a gate like that gets disabled within a
+month. What is actually load-bearing is checked instead — `cargo publish`'s
+verification build compiles the packaged crate with `web/dist/` embedded and no
+`zero` present. A stale bundle is a cosmetic wrong-version UI; the convention
+carries it. **Regenerate before committing.**
+
+The embedded UI costs about 450 KB of binary: 55 KB of JavaScript, 44 KB of CSS,
+and 350 KB of Geist woff2 served from lanyard itself so no page ever asks a CDN
+or Google Fonts for anything.
 
 ## Read this before you use it
 
@@ -551,6 +576,98 @@ without waiting.
 All three are plain `POST` forms. No JavaScript, and no CSRF token — the cookie
 is `SameSite=Lax`, so a cross-site POST arrives without it and therefore acts on
 no session.
+
+## The live request log
+
+**lanyard already knows why your login failed. This is where it tells you.**
+
+Every request to `/oidc/*` produces one structured event: what was asked, what
+was decided, what came out. The `error_description` sentences that used to be
+written to a `400` on a back-channel call nobody sees are on it, whole. So is
+the `client_id`, on every line — which is what makes one instance serving three
+projects readable rather than noise.
+
+There are three surfaces and one stream behind them.
+
+**stdout, always on, no flag.** `lanyard serve` prints one aligned line per
+request:
+
+```
+14:02:09  billing-web   GET  /oidc/authorize   302    0ms  ada  scope=openid,email,profile  pkce=S256
+14:02:11  billing-web   POST /oidc/token       400    3ms  invalid_grant  the code_verifier does not match the S256 code_challenge this code was issued against
+14:02:14  lanyard-cli   POST /oidc/token       200    2ms  client_credentials  sub=ada  aud=billing-api  exp=+60s
+14:02:19  lanyard-cli   POST /oidc/token       200    2ms  client_credentials  sub=ada  aud=billing-api  exp=+60s  flaw=alg-none
+```
+
+Nothing is persisted — `lanyard serve > lanyard.log` is the whole story, and the
+log resets on restart. Times are **UTC**: `std::time` has no local offset and a
+timezone crate was not worth the dependency.
+
+**`lanyard logs`, in a second terminal.** Connects to the running singleton over
+HTTP, the way `lanyard token` performs a real grant rather than signing locally.
+Bare, it prints exactly what `lanyard serve` is printing in the first terminal;
+`--json` gives one JSON object per line, for `jq`:
+
+```
+lanyard logs
+lanyard logs --json | jq -r '.client_id + " " + .endpoint'
+```
+
+Both replay everything still in the ring before going live, so starting it after
+a login that already failed still shows you the failure. With no lanyard running
+it exits non-zero and says so, rather than exiting `0` having printed nothing.
+
+**`/_/log`, in a browser.** A row per request, newest first, a `client_id`
+filter, pause and clear — and **click a row** for the decoded claims: the header
+and payload of every token minted, `exp` as both the epoch integer and a human
+time, and, on a PKCE failure, the three values side by side:
+
+```
+PKCE (S256)
+  code_verifier presented       dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXX
+  challenge computed from it    ZtNnvmu4djKPm9mr322ZXBdqrXU41t_xP0Fp3EM3H84
+  code_challenge recorded       E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+```
+
+Which two were meant to be equal is not something you have to be told.
+
+### The endpoints, if you want the stream yourself
+
+| | |
+|---|---|
+| `GET /_/api/events` | `text/event-stream`. Replays the ring, then streams live. Honours `Last-Event-ID` |
+| `GET /_/api/events?format=ndjson` | The same objects, one JSON per line |
+| `POST /_/api/events/clear` | Drains the ring and empties every open `/_/log`. `204` |
+
+```
+curl -N 'http://127.0.0.1:9500/_/api/events?format=ndjson' | jq -c '{client_id, endpoint, status, error}'
+```
+
+The ring holds the last 1000 events. A reader that connects and stops reading —
+a backgrounded tab, a `curl` into a full pipe — never slows a login down: the
+fan-out is lossy at the subscriber and never at the source, and a reader that
+falls behind gets a `{"dropped": N}` marker naming how many it missed. **A log
+with a silent hole in it is worse than no log**, because you conclude the
+request never happened.
+
+`/oidc/jwks` and the discovery document emit nothing — they are static, and an
+SDK's poll loop on them would drown everything else. Under `/_/`, exactly two
+routes emit: `POST /_/pick`, because "why am I signed in as the wrong person" is
+a question the log has to answer, and the test seam's `POST /_/api/token`.
+
+### The log prints secrets, and that is deliberate
+
+**It prints authorization codes, refresh tokens, `code_verifier`s, and any
+`client_secret` a client sends.** It prints the full decoded claims of every
+token minted. Nothing is redacted.
+
+That follows from everything else here. lanyard accepts every `client_secret`
+without looking at it, so starring one out would teach you that lanyard checked
+something it did not; and a `code_verifier` you cannot see is a PKCE failure you
+cannot diagnose. **The log is exactly as sensitive as the tokens `lanyard token`
+already prints to your terminal** — 60-second tokens signed by a key whose
+private half is published in this repository. Treat a pasted log the way you
+would treat a pasted token.
 
 ## Scope, and what it filters
 

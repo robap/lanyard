@@ -28,6 +28,7 @@ async fn spawn() -> String {
         key,
         personas: Personas::builtin(),
         stores: Stores::default(),
+        events: lanyard_cli::events::EventBus::new(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -91,6 +92,58 @@ fn run(url: Option<&str>, args: &[&str]) -> Output {
         command.env("LLVM_PROFILE_FILE", profile);
     }
     command.output().unwrap()
+}
+
+/// `lanyard logs` never exits on its own — the stream is open until lanyard
+/// stops — so it cannot be driven by [`run`], which waits for a process to end.
+/// This starts it, collects lines off its stdout until `lines` have arrived or
+/// the deadline passes, then kills it and gives back what it printed.
+fn run_logs(url: &str, args: &[&str], lines: usize) -> Vec<String> {
+    use std::io::BufRead as _;
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_lanyard"));
+    command
+        .env_clear()
+        .env("HOME", "/nonexistent")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("LANYARD_URL", url)
+        .args(args)
+        .stdout(std::process::Stdio::piped());
+    if let Ok(profile) = std::env::var("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut child = command.spawn().unwrap();
+
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let mut collected = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while collected.len() < lines {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(line) => collected.push(line),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    collected
 }
 
 fn stdout(output: &Output) -> String {
@@ -345,13 +398,89 @@ async fn as_is_required_and_its_absence_is_a_usage_error() {
     }
 }
 
+// ------------------------------------------------------------ lanyard logs --
+
+/// Criterion 3. One client id per event, as each happens — the shape
+/// `lanyard logs --json | jq .client_id` reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_json_prints_one_json_object_per_event() {
+    let base = spawn().await;
+    let url = base.clone();
+    // Minted from another thread while the child is already connected, so this
+    // is the live half of the stream rather than the replay.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        for persona in ["ada", "mira"] {
+            run(Some(&url), &["token", "--as", persona]);
+        }
+    });
+
+    let lines = run_logs(&base, &["logs", "--json"], 2);
+    assert!(lines.len() >= 2, "{lines:#?}");
+    for line in &lines {
+        let event: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON: {line:?} ({e})"));
+        assert_eq!(event["client_id"], "lanyard-cli", "{event}");
+        assert_eq!(event["endpoint"], "/oidc/token");
+    }
+}
+
+/// Criteria 4 and 6 together: the same lines `lanyard serve` prints on its own
+/// stdout, and three already-finished mints print before the stream goes live.
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_replays_finished_requests_in_the_serve_format() {
+    let base = spawn().await;
+    for persona in ["ada", "mira", "ada"] {
+        run(
+            Some(&base),
+            &["token", "--as", persona, "--aud", "billing-api"],
+        );
+    }
+
+    let lines = run_logs(&base, &["logs"], 3);
+    assert_eq!(
+        lines.len(),
+        3,
+        "the three already-finished mints: {lines:#?}"
+    );
+    for line in &lines {
+        assert!(line.contains("lanyard-cli"), "{line}");
+        assert!(line.contains("POST /oidc/token"), "{line}");
+        assert!(line.contains("client_credentials"), "{line}");
+        assert!(line.contains("aud=billing-api"), "{line}");
+        assert!(!line.contains('{'), "not JSON without --json: {line}");
+    }
+}
+
+/// Criterion 7. A tool that exits `0` having printed nothing is a tool that
+/// lies about having looked — the README's existing stance, applied to the
+/// fourth subcommand.
+#[tokio::test(flavor = "multi_thread")]
+async fn logs_with_no_lanyard_running_fails_and_names_the_connection() {
+    let dead = dead_url().await;
+    let output = run(Some(&dead), &["logs"]);
+    assert!(!output.status.success(), "must not exit 0");
+    assert_eq!(output.stdout.len(), 0, "nothing on stdout");
+    let err = stderr(&output);
+    assert!(err.contains(&dead), "names the address tried: {err}");
+    assert!(err.contains("lanyard serve"), "names the fix: {err}");
+}
+
 #[test]
 fn help_lists_the_commands_and_the_token_flags() {
     let top = stdout(&run(None, &["--help"]));
-    for command in ["serve", "token", "env"] {
+    for command in ["serve", "token", "env", "logs"] {
         assert!(
             top.contains(command),
             "`lanyard --help` omits {command}:\n{top}"
+        );
+    }
+
+    let logs = stdout(&run(None, &["logs", "--help"]));
+    for flag in ["--json", "--url"] {
+        assert!(
+            logs.contains(flag),
+            "`lanyard logs --help` omits {flag}:\n{logs}"
         );
     }
 

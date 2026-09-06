@@ -1,0 +1,19 @@
+[project]
+root = "web"
+
+[dev]
+port = 3000
+# `zero dev`'s proxy is deliberately not used. `crates/zero-dev/src/proxy.rs`
+# reads the upstream response with `bytes().await` — whole-body buffering — so a
+# proxied `/_/api/events` would never flush a frame, and the one feature under
+# development is the one the dev server could not show. `rust-embed` reads
+# `web/dist/` from disk in debug builds, so the loop is `zero build && cargo run`
+# against the real binary, same-origin, with no proxy and therefore no CORS work
+# on the event endpoints at all.
+
+# `out` is resolved relative to the invocation cwd (the repo root, where this
+# file lives), NOT relative to `root`. So it carries the `web/` prefix to land
+# beside the sources in `web/dist/` — which is what `rust-embed` embeds
+# (`src/embed.rs`, `#[folder = "web/dist/"]`).
+[build]
+out = "web/dist"

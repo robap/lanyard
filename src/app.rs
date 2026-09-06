@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::config::Config;
+use crate::events::EventBus;
 use crate::keys::SigningKey;
 use crate::persona::Personas;
 use crate::store::Stores;
@@ -18,6 +19,10 @@ pub struct AppState {
     /// sessions. Nothing here is persisted, which is why restarting lanyard
     /// logs everybody out.
     pub stores: Stores,
+    /// The live request log's bus. Not "mutable state" in the sense above — a
+    /// ring of what already happened, which nothing reads back to make a
+    /// decision.
+    pub events: EventBus,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -33,11 +38,25 @@ pub fn router(state: SharedState) -> Router {
         // The UI and the JSON seam share the `/_` nest: one is for a human and
         // one is for a test, and both are lanyard talking about itself rather
         // than speaking the protocol.
-        .nest("/_", crate::seam::routes().merge(crate::ui::routes()))
+        .nest(
+            "/_",
+            crate::seam::routes()
+                .merge(crate::api::routes())
+                .merge(crate::embed::routes())
+                .merge(crate::ui::routes()),
+        )
         // **`/_/` is routed twice on purpose.** `nest("/_")` answers `/_` and
         // `/_/pick`, but not `/_/` — axum treats the nest root's trailing slash
         // as a different path. `/_/` is the URL the banner prints and the URL
         // `/authorize` redirects to, so it is routed rather than moved.
         .route("/_/", axum::routing::get(crate::ui::picker))
+        // **Outside everything**, so one request is one event whatever answered
+        // it — a handler, a 404, or axum's own 405. What it does *not* log is
+        // in `log_layer::emits`, and the event stream is on that list for a
+        // reason.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::log_layer::layer,
+        ))
         .with_state(state)
 }

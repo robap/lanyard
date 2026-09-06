@@ -25,6 +25,7 @@ use axum::Json;
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::log_detail::{attach, LogDetail};
 use crate::oidc::revocation::{self, Presented};
 use crate::oidc::token::Form;
 
@@ -61,7 +62,10 @@ async fn introspect(State(state): State<SharedState>, body: Bytes) -> Response {
             // No `exp`, `iat` or `jti`: a refresh token is an id into a record,
             // not a document with claims, and inventing three would be lanyard
             // saying something it does not know.
-            json_response(Value::Object(body))
+            attach(
+                json_response(Value::Object(body)),
+                outcome(true, Some(&record.client_id)),
+            )
         }
         Presented::Unrecognized => inactive(),
     }
@@ -89,12 +93,40 @@ fn active(claims: &Map<String, Value>) -> Response {
             body.insert(name.to_string(), value.clone());
         }
     }
-    json_response(Value::Object(body))
+    let client_id = claims
+        .get("client_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    attach(
+        json_response(Value::Object(body)),
+        outcome(true, client_id.as_deref()),
+    )
 }
 
 /// **Exactly two words, and nothing more** (RFC 7662 §2.2).
+///
+/// The *log* says more, and has to: "lanyard said no" and "lanyard was never
+/// called" look identical from the client side, and telling them apart is what
+/// the log is for. Nothing about the response body changes.
 fn inactive() -> Response {
-    json_response(json!({ "active": false }))
+    attach(
+        json_response(json!({ "active": false })),
+        outcome(false, None),
+    )
+}
+
+/// What this endpoint decided, for the log: whether the token was recognized
+/// and which application it belonged to.
+fn outcome(active: bool, client_id: Option<&str>) -> LogDetail {
+    LogDetail {
+        client_id: client_id.map(str::to_string),
+        detail: Some(
+            [("active".to_string(), Value::Bool(active))]
+                .into_iter()
+                .collect(),
+        ),
+        ..LogDetail::default()
+    }
 }
 
 fn json_response(body: Value) -> Response {

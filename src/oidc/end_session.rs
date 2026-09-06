@@ -70,6 +70,23 @@ async fn end_session_post(
 }
 
 fn end_session(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
+    let response = logout(state, headers, &form);
+    // The application named by the hint, and the fact that a session actually
+    // ended. "Why am I still signed in" is a question this line answers.
+    crate::log_detail::attach(
+        response,
+        crate::log_detail::LogDetail {
+            client_id: form
+                .get("id_token_hint")
+                .and_then(audience_of)
+                .or_else(|| form.get("client_id").map(str::to_string)),
+            request: Some(crate::log_detail::request_map(form.pairs())),
+            ..crate::log_detail::LogDetail::default()
+        },
+    )
+}
+
+fn logout(state: &SharedState, headers: &HeaderMap, form: &Form) -> Response {
     // **The rejection comes first, and it logs nobody out.** A logout lanyard
     // refused is a request it never acted on; ending the session and then
     // rendering an error would leave the browser signed out of a page that says
@@ -79,22 +96,39 @@ fn end_session(state: &SharedState, headers: &HeaderMap, form: Form) -> Response
         Some(raw) => match redirect_uri::check(PARAMETER, raw) {
             Ok(url) => Some(url),
             Err(message) => {
-                return html::rejected_page(
-                    &message,
-                    Some(raw),
-                    &redirect_uri::rule(PARAMETER),
-                    "Nothing was sent to that address and nobody was logged out. \
-                     Sending a browser to an address lanyard has just decided not to \
-                     trust is what would make the boundary decorative, and this is the \
-                     one thing lanyard does not accept.",
-                )
+                // Refused, and **nobody was logged out** — which is exactly the
+                // outcome the log has to record, or a developer reads a
+                // rejection and assumes the session survived by accident.
+                return crate::log_detail::attach(
+                    html::rejected_page(
+                        &message,
+                        Some(raw),
+                        &redirect_uri::rule(PARAMETER),
+                        "Nothing was sent to that address and nobody was logged out. \
+                         Sending a browser to an address lanyard has just decided not to \
+                         trust is what would make the boundary decorative, and this is the \
+                         one thing lanyard does not accept.",
+                    ),
+                    crate::log_detail::LogDetail {
+                        error: Some("invalid_request".to_string()),
+                        error_description: Some(message),
+                        detail: Some(
+                            [("signed_out".to_string(), Value::Bool(false))]
+                                .into_iter()
+                                .collect(),
+                        ),
+                        ..crate::log_detail::LogDetail::default()
+                    },
+                );
             }
         },
     };
 
     // Dropped **before** the response is written. The record is what matters;
     // the cookie below is what makes the logout readable in `curl -i`.
+    let mut signed_out = false;
     if let Some(session_id) = session::from_headers(headers) {
+        signed_out = true;
         state
             .stores
             .sessions
@@ -129,25 +163,36 @@ fn end_session(state: &SharedState, headers: &HeaderMap, form: Form) -> Response
         None => signed_out_page(application.as_deref()),
     };
 
-    with_cleared_cookie(response)
+    crate::log_detail::attach(
+        with_cleared_cookie(response),
+        crate::log_detail::LogDetail {
+            detail: Some(
+                [("signed_out".to_string(), Value::Bool(signed_out))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..crate::log_detail::LogDetail::default()
+        },
+    )
 }
 
 fn signed_out_page(application: Option<&str>) -> Response {
     let named = match application {
         Some(application) => format!(
-            "<p>The application that sent you here was <code>{}</code>. It has its own \
-             session cookie, and only it can clear that — this page is about \
-             lanyard's.</p>\n",
+            "<p class=\"text-body\">The application that sent you here was \
+             <code>{}</code>. It has its own session cookie, and only it can clear that — \
+             this page is about lanyard's.</p>\n",
             html::escape(application)
         ),
         None => String::new(),
     };
     let body = format!(
-        "<h1>You are signed out of lanyard</h1>\n\
-         <p class=\"lede\">This browser's lanyard session is gone: every persona it had \
-         chosen, for every application, and every refresh token it was issued. The next \
-         login from any application will show the picker.</p>\n{named}\
-         <footer>lanyard · <a href=\"/_/\">persona picker</a></footer>\n"
+        "<h1 class=\"text-h2\">You are signed out of lanyard</h1>\n\
+         <p class=\"lede text-body\">This browser's lanyard session is gone: every persona \
+         it had chosen, for every application, and every refresh token it was issued. The \
+         next login from any application will show the picker.</p>\n{named}\
+         <footer class=\"text-small\">lanyard · <a href=\"/_/\">persona picker</a> · \
+         <a href=\"/_/log\">live log</a></footer>\n"
     );
     html::html(StatusCode::OK, html::page("lanyard — signed out", &body))
 }

@@ -23,9 +23,11 @@ use axum::body::Bytes;
 use axum::extract::{RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde_json::Value;
 use url::Url;
 
 use crate::app::SharedState;
+use crate::log_detail::{attach, LogDetail};
 use crate::oidc::code::{Challenge, ChallengeMethod, CodeRecord};
 use crate::oidc::redirect_uri;
 use crate::oidc::scope::Scopes;
@@ -88,7 +90,7 @@ async fn authorize_get(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    authorize(
+    logged(
         &state,
         &headers,
         Form::from_query(query.as_deref().unwrap_or_default()),
@@ -102,7 +104,40 @@ async fn authorize_post(
     body: Bytes,
 ) -> Response {
     let form = Form::parse(&body).chain(Form::from_query(query.as_deref().unwrap_or_default()));
-    authorize(&state, &headers, form)
+    logged(&state, &headers, form)
+}
+
+/// The envelope, added on the way out: the `client_id` and every parameter as
+/// it was decoded. What only the handler knew — the persona a remembered
+/// session resolved to, the host a `redirect_uri` was refused for, the OAuth
+/// error a redirect carried — is already attached, and
+/// [`LogDetail`]'s first-writer-wins merge leaves it alone.
+fn logged(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
+    let mut request = crate::log_detail::request_map(form.pairs());
+    // **Decided, not sent.** `response_mode` is absent from most requests and
+    // means `query`; a log that echoed the absence would make a developer
+    // looking at a `form_post` bug guess at what lanyard chose.
+    request
+        .entry("response_mode")
+        .or_insert_with(|| serde_json::Value::from(mode_of(&form)));
+
+    let client_id = form.get("client_id").map(str::to_string);
+    let response = authorize(state, headers, form);
+    attach(
+        response,
+        LogDetail {
+            client_id,
+            request: Some(request),
+            ..LogDetail::default()
+        },
+    )
+}
+
+/// The response mode this request resolves to, for the log. An unsupported
+/// value is echoed rather than corrected to `query`: the request is refused,
+/// and the log describes the request.
+fn mode_of(form: &Form) -> &str {
+    form.get("response_mode").unwrap_or("query")
 }
 
 fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
@@ -210,14 +245,29 @@ pub fn complete(
         .lock()
         .expect("codes")
         .insert(CodeRecord {
-            persona,
+            persona: persona.clone(),
             auth_time,
             request: request.clone(),
             // Carried through the code so a refresh token minted from it knows
             // which browser session **Log out** revokes it with.
             session_id,
         });
-    deliver(&request, &code)
+    // **Who this login is for.** Attached here rather than at either caller,
+    // because both of them end here: a login that showed the picker and one
+    // that used a remembered selection are byte-identical to the RP, and they
+    // are one line apart in the log for the same reason.
+    attach(
+        deliver(&request, &code),
+        LogDetail {
+            client_id: Some(request.client_id.clone()),
+            detail: Some(
+                [("persona".to_string(), Value::from(persona.id.clone()))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..LogDetail::default()
+        },
+    )
 }
 
 fn with_optional_cookie(response: Response, session_id: Option<String>) -> Response {
@@ -241,6 +291,15 @@ fn unix_now() -> u64 {
 enum Rejection {
     Rendered(Box<Response>),
     Redirected(Box<Response>),
+}
+
+/// [`rejected`] always builds a [`Rejection::Rendered`]; this unwraps it so the
+/// one call site that has more to say can attach to the page it built.
+fn unwrap_rendered(rejection: Rejection) -> Box<Response> {
+    match rejection {
+        Rejection::Rendered(page) => page,
+        Rejection::Redirected(response) => response,
+    }
 }
 
 fn parse(form: &Form) -> Result<AuthRequest, Rejection> {
@@ -268,11 +327,36 @@ fn parse(form: &Form) -> Result<AuthRequest, Rejection> {
     // because it covers what the one-line rule does not — a URL that will not
     // parse at all, or a scheme rather than a host.
     let redirect_uri = redirect_uri::check("redirect_uri", raw_redirect).map_err(|message| {
-        rejected(
-            &message,
-            Some(raw_redirect),
-            &redirect_uri::rule("redirect_uri"),
-        )
+        // **Criterion 12.** Nothing was redirected and the RP was never
+        // contacted, so the log is the only place this failure exists at all.
+        // The host is named separately from the whole URL because the host is
+        // what the rule is about.
+        let host = Url::parse(raw_redirect)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string));
+        Rejection::Rendered(Box::new(attach(
+            *unwrap_rendered(rejected(
+                &message,
+                Some(raw_redirect),
+                &redirect_uri::rule("redirect_uri"),
+            )),
+            LogDetail {
+                error: Some("invalid_request".to_string()),
+                error_description: Some(message.clone()),
+                detail: Some(
+                    [(
+                        "redirect_uri".to_string(),
+                        serde_json::json!({
+                            "presented": raw_redirect,
+                            "host": host,
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..LogDetail::default()
+            },
+        )))
     })?;
 
     // ---- everything below here redirects ----------------------------------
@@ -467,7 +551,16 @@ pub fn redirect_error(
             pairs.append_pair("state", state);
         }
     }
-    found(url.as_str())
+    // The RP will read this out of its query string; the developer reads it off
+    // the log without having to look in a browser's address bar first.
+    attach(
+        found(url.as_str()),
+        LogDetail {
+            error: Some(error.to_string()),
+            error_description: Some(description.to_string()),
+            ..LogDetail::default()
+        },
+    )
 }
 
 /// `302 Found`, spelled out rather than via `Redirect`, which is `303` in axum

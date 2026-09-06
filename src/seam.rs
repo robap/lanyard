@@ -21,6 +21,7 @@ use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
 use crate::app::SharedState;
+use crate::log_detail::{attach, LogDetail};
 use crate::oidc::flaw::Flaw;
 use crate::oidc::issue::{self, DEFAULT_TTL};
 use crate::oidc::scope::ClaimFilter;
@@ -33,12 +34,24 @@ pub fn routes() -> Router<SharedState> {
 
 /// `400` with `{"error", "error_description"}` — the shape an OAuth client
 /// already knows how to read.
+///
+/// The one funnel for this endpoint's refusals, and therefore where the log
+/// learns about them — the same arrangement `/oidc/token`'s `bad_request` has,
+/// for the same reason.
 fn bad_request(error: &str, description: String) -> Response {
-    (
+    let response = (
         StatusCode::BAD_REQUEST,
-        Json(json!({ "error": error, "error_description": description })),
+        Json(json!({ "error": error, "error_description": description.clone() })),
     )
-        .into_response()
+        .into_response();
+    attach(
+        response,
+        LogDetail {
+            error: Some(error.to_string()),
+            error_description: Some(description),
+            ..LogDetail::default()
+        },
+    )
 }
 
 async fn token(
@@ -108,7 +121,23 @@ async fn token(
             if let Some(flaw) = flaw {
                 response["flaw"] = Value::from(flaw.as_str());
             }
-            Json(response).into_response()
+            // The seam mints, so it is logged like every other thing that
+            // mints — the flaw it was asked for and the header and payload that
+            // actually came out. `--alg-none`'s claims are perfect; only the
+            // emitted header says what happened.
+            attach(
+                Json(response).into_response(),
+                LogDetail {
+                    flaw: flaw.map(|flaw| flaw.as_str().to_string()),
+                    issued: crate::log_detail::decoded_token(&issued.token).map(|decoded| {
+                        [("access_token".to_string(), decoded)]
+                            .into_iter()
+                            .collect()
+                    }),
+                    request: Some(query_map(&query)),
+                    ..LogDetail::default()
+                },
+            )
         }
         Err(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -116,6 +145,14 @@ async fn token(
         )
             .into_response(),
     }
+}
+
+/// **The query string is how they are minted**, so it is what the event's
+/// `request` carries. The body is the claims, and those come back decoded in
+/// `issued` rather than echoed twice.
+fn query_map(query: &HashMap<String, String>) -> Map<String, Value> {
+    let pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    crate::log_detail::request_map(&pairs)
 }
 
 /// The body may be absent or empty; anything else must be a JSON object.
