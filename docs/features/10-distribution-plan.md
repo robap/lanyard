@@ -135,7 +135,7 @@ outcome is real, not when code is written.
 - [x] 7. **The tap exists** — `robap/homebrew-tap`, public, empty;
       `curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/robap/homebrew-tap`
       returns `200` where it returns `404` today.
-- [ ] 8. **The token exists** — a PAT with `repo` scope, added to
+- [x] 8. **The token exists** — a PAT with `repo` scope, added to
       `robap/lanyard` as the `HOMEBREW_TAP_TOKEN` secret, listed in the repo's
       Actions secrets.
 
@@ -167,28 +167,28 @@ outcome is real, not when code is written.
 
 **The release**
 
-- [ ] 14. **`v0.1.0`** — pushed. Release page carries the four archives plus
+- [x] 14. **`v0.1.0`** — pushed. Release page carries the four archives plus
       installer, manifest and checksums; every checksum matches `sha256sum`
       locally; the body is the `0.1.0` section of `CHANGELOG.md`; the tap gains
       `lanyard.rb`; GHCR gains `:0.1.0` and `:latest`.
 
 **Observing it**
 
-- [ ] 15. **The curl installer, on a bare distro** — in
+- [x] 15. **The curl installer, on a bare distro** — in
       `podman run --rm -it docker.io/library/debian:12` with `command -v cargo`
       empty, the README's installer line puts `lanyard` on `PATH` and `serve`
       answers discovery.
-- [ ] 16. **Homebrew, no Rust** — `podman run --rm -it docker.io/homebrew/brew`,
+- [x] 16. **Homebrew, no Rust** — `podman run --rm -it docker.io/homebrew/brew`,
       `brew install robap/tap/lanyard`, nothing compiles, `lanyard --version`
       prints `0.1.0`, discovery answers. If the formula turns out to be
       macOS-only, record it and fall back per *Risks*.
-- [ ] 17. **`brew services`, decided and observed** — check the generated
+- [x] 17. **`brew services`, decided and observed** — check the generated
       formula for a `service` stanza. Per the spec's open question 2 the
       expected answer is *no stanza*, in which case the README says so and names
       `lanyard serve` instead; if it is there, `brew services start lanyard`
       leaves a lanyard answering discovery. Either way, one of the two is
       watched.
-- [ ] 18. **The image on this machine** — `podman pull
+- [x] 18. **The image on this machine** — `podman pull
       ghcr.io/robap/lanyard:0.1.0`, run with `-p 9500:9500`, discovery from the
       host; `podman inspect` reports `healthy` within 30s; under 20 MB;
       `--entrypoint /bin/sh` still fails; `:latest` and `:0.1.0` are the same
@@ -293,6 +293,60 @@ differed, or a risk that resolved.
   each been seen to fail for real — `clippy` never, but `test` did, on
   `macos-latest`, and it failed the run — so the job wiring itself is proven;
   it is only the `fmt` step specifically that has only ever been green.
+
+- **`v0.1.0` is out, and everything the rc rehearsed held.** Release run
+  <https://github.com/robap/lanyard/actions/runs/34139793679> — all nine jobs
+  green, **including `publish-homebrew-formula`**, which had never run before
+  and was the last untested piece (the `HOMEBREW_TAP_TOKEN` worked first time).
+  `Release image` then fired **on its own** via `workflow_run`, unattended, which
+  is the trigger fix proving itself.
+  Observed from this machine:
+  - Release page: four archives, a `.sha256` each, `lanyard-cli-installer.sh`,
+    `dist-manifest.json`, `sha256.sum`, `lanyard.rb`, `source.tar.gz`. **No
+    Windows archive and no `.ps1`.** All four downloaded; every recorded
+    checksum matches `sha256sum`, both individually and via `sha256.sum`.
+  - `file` on the x86_64 binary → `static-pie linked`; on the aarch64 one →
+    `ARM aarch64 … statically linked`, the criterion's exact words.
+  - `ghcr.io/robap/lanyard` `:0.1.0` and `:latest` resolve to the **same
+    digest** `sha256:c88b8889…`, a Docker manifest list of exactly
+    `linux/amd64` + `linux/arm64`. Pulled with no login: 8.34 MB, `healthy` in
+    2s, discovery `200`, `/_/health` says `0.1.0`, `--entrypoint /bin/sh`
+    fails, `kid` `TXntCt2b…QWpU` matches the native binary.
+  - `debian:12` with `command -v cargo` empty: the README's `curl … | sh` line,
+    verbatim, installed to `~/.local/bin` and `lanyard serve` answered
+    discovery.
+  - `homebrew/brew` with no `cargo` and no `rustc`: `brew install
+    robap/tap/lanyard` installed `lanyard 0.1.0` in one second, discovery
+    `200`. The published formula's four `sha256` values match the four archives
+    downloaded independently.
+  - The README's `docker run … ghcr.io/robap/lanyard` line was run **untagged**,
+    as written, and served discovery from `:latest`. (podman stands in for
+    docker; there is no docker on this machine.)
+- **The release body is the changelog section *plus* dist's own install
+  instructions.** Spec criterion 2 says the body "is" the `0.1.0` section; in
+  fact it contains that section verbatim under a `## Release Notes` heading, and
+  `dist` appends `## Install lanyard-cli 0.1.0` and `## Download` sections it
+  generates. Strictly a divergence from the criterion's wording, and a better
+  release page than the criterion asked for.
+- **Homebrew-on-Linux drags in a compiler, and it is not ours.** `brew install`
+  in the `homebrew/brew` container installed `gcc` (463 MB), `binutils` and
+  nine other packages as dependencies before installing lanyard. Nothing of
+  lanyard's compiled — it was unpacked in one second — and the formula has no
+  `depends_on` at all; this is Homebrew's own behaviour for a formula it has no
+  bottle for. Criterion 7 is about lanyard not being compiled, and it is not.
+  Worth knowing before recommending the Linux brew path over the `curl` line,
+  which installs 5 MB and nothing else.
+- **The "did anything compile?" check in `release-smoke.yml` was wrong, and the
+  `homebrew/brew` run caught it before macOS did.** It grepped the install log
+  for `Downloading https://github.com/robap/lanyard/releases/download/`; that
+  line **never appears**, because Homebrew suppresses its progress output when
+  stdout is not a terminal, which in a CI job it never is. The assertion would
+  have failed the macOS job for no reason.
+  **Rewritten to check the package definition instead** — the formula's `url`
+  must point at a release download, and the formula must contain no
+  `depends_on`, no `cargo` and no `rust`. Both assertions were run against the
+  actually-published `Formula/lanyard.rb` and pass. Also silenced the
+  "developer command" warning `brew formula` prints to stderr.
 
 - **The rc's image is real, and every property it was built to have holds.**
   Run <https://github.com/robap/lanyard/actions/runs/34139259951>: both
@@ -449,29 +503,29 @@ differed, or a risk that resolved.
 Mirrors the spec. `/implement` is not done until every box passes by driving the
 named client. Numbers are the spec's.
 
-- [ ] 1. `v0.1.0`'s release page lists archives for `aarch64-apple-darwin`,
+- [x] 1. `v0.1.0`'s release page lists archives for `aarch64-apple-darwin`,
       `x86_64-apple-darwin`, `aarch64-unknown-linux-musl`,
       `x86_64-unknown-linux-musl`, plus `lanyard-installer.sh`,
       `dist-manifest.json` and a checksum each — and **no** Windows archive and
       no `lanyard-installer.ps1`.
-- [ ] 2. Every archive's recorded checksum matches `sha256sum` locally; the
+- [x] 2. Every archive's recorded checksum matches `sha256sum` locally; the
       release body is `CHANGELOG.md`'s `0.1.0` section.
 - [x] 3. `v0.1.0-rc.1` produced a GitHub **prerelease**, and
       `brew install robap/tap/lanyard` did not offer it at that moment.
-- [ ] 4. `docker.io/library/debian:12`, no cargo: the README's `curl … | sh`
+- [x] 4. `docker.io/library/debian:12`, no cargo: the README's `curl … | sh`
       line installs `lanyard`; `serve` prints the banner; discovery answers with
       the issuer the banner named.
-- [ ] 5. `file` → `statically linked`, `ldd` → `not a dynamic executable`; the
+- [x] 5. `file` → `statically linked`, `ldd` → `not a dynamic executable`; the
       same binary serves discovery from inside `docker.io/library/debian:10`
       with no `GLIBC_` error.
 - [ ] 6. **(CI)** `ubuntu-24.04-arm`: the aarch64 binary is `ARM aarch64 …
       statically linked`, serves, and mints a token.
-- [ ] 7. `docker.io/homebrew/brew`: `brew install robap/tap/lanyard` compiles
+- [x] 7. `docker.io/homebrew/brew`: `brew install robap/tap/lanyard` compiles
       nothing, `lanyard --version` is `0.1.0`, discovery answers, `command -v
       cargo` is empty.
 - [ ] 8. **(CI)** `macos-latest`: `brew install`, `serve`, discovery `200`, and
       a minted token accepted by `scripts/jose-verify.mjs` against the live JWKS.
-- [ ] 9. Either `brew services start lanyard` leaves a lanyard answering
+- [x] 9. Either `brew services start lanyard` leaves a lanyard answering
       discovery, or the README says it does not work and names what to run —
       and that README command is the one that was run.
 - [ ] 10. **On Windows, watched by a person:** lanyard in WSL2 via the README
@@ -480,13 +534,13 @@ named client. Numbers are the spec's.
 - [ ] 11. The README's `## Install` names both Windows paths with a runnable
       line each and the `127.0.0.1` caveat; the WSL line is the one criterion 10
       was run from, verbatim.
-- [ ] 12. `podman pull ghcr.io/robap/lanyard:0.1.0` with no login; `-p
+- [x] 12. `podman pull ghcr.io/robap/lanyard:0.1.0` with no login; `-p
       9500:9500` answers discovery; `healthy` within 30s; under 20 MB;
       `--entrypoint /bin/sh` fails.
 - [ ] 13. The manifest lists `linux/amd64` and `linux/arm64`; **(CI)** an
       `ubuntu-24.04-arm` job pulls the same tag, gets the arm64 digest, runs it,
       and gets `200` on discovery.
-- [ ] 14. `:latest` and `:0.1.0` are the same digest, and the `kid` served
+- [x] 14. `:latest` and `:0.1.0` are the same digest, and the `kid` served
       matches the native binary's and Phase 8's local image's.
 - [x] 15. **(CI)** `ci.yml` green on `ubuntu-latest` and `macos-latest` for a
       push to `main`. *(The deliberate-formatting-error half was dropped by
@@ -494,6 +548,6 @@ named client. Numbers are the spec's.
 - [x] 16. **(CI)** `cargo package --locked` succeeds; the file list contains
       `web/dist/assets/*` and `web/dist/index.html` and no path under `docs/`,
       `spikes/`, `web/src/` or `.claude/`.
-- [ ] 17. A reader following `## Install` reaches a running lanyard by one of
+- [x] 17. A reader following `## Install` reaches a running lanyard by one of
       three copy-pasted lines, with no Rust toolchain mentioned above them; each
       was run verbatim to produce criteria 4, 7 and 12.

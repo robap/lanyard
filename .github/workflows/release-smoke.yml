@@ -103,12 +103,19 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          brew install robap/tap/lanyard 2>&1 | tee brew.log
-          # Confirm Homebrew downloaded a finished binary instead of building
-          # one from source. Installing without needing a Rust toolchain is the
-          # entire point of shipping a Homebrew package, so if the log does not
-          # show that download, something is wrong even though it "worked".
-          grep -qE 'Downloading https://github.com/robap/lanyard/releases/download/' brew.log
+          brew install robap/tap/lanyard
+
+          # **Confirm nothing was compiled**, which is the entire point of
+          # shipping a Homebrew package: installing must not need a Rust
+          # toolchain. Checked against the package definition rather than the
+          # install log, because Homebrew hides its download lines when its
+          # output is not going to a terminal — which in a CI job it never is.
+          formula=$(brew formula robap/tap/lanyard)
+          grep -qE 'url "https://github.com/robap/lanyard/releases/download/' "$formula"
+          if grep -inE 'depends_on|cargo|rustc?"' "$formula"; then
+            echo "::error::the formula grew a build step; it should only unpack a released binary"
+            exit 1
+          fi
           # The version it reports should be the tag we asked for. If those
           # ever drift apart, a bug report saying "I'm on 0.1.0" stops meaning
           # anything.
@@ -122,7 +129,9 @@ jobs:
       - name: Does Homebrew think it can run this as a background service?
         run: |
           set -euo pipefail
-          formula=$(brew formula robap/tap/lanyard)
+          # `brew formula` is a developer command and says so on stderr; that
+          # warning is noise, not a failure.
+          formula=$(brew formula robap/tap/lanyard 2>/dev/null)
           if grep -qE '^\s*service do' "$formula"; then
             echo "SERVICE STANZA PRESENT — brew services start lanyard should work"
           else
