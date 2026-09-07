@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>node-spa — silent renew callback</title>
+
+<!-- **This page is never seen.** `oidc-client-ts` loads it inside a hidden
+     iframe at the end of a `prompt=none` renew, and everything it does is one
+     `postMessage` to the frame above it. It renders nothing on purpose: a
+     visible byte here would be a visible byte in an iframe the SPA styles to
+     0×0.
+
+     It exists because `silent_redirect_uri` **defaults to `redirect_uri`**, and
+     this spike's `redirect_uri` is `/`, whose `index.html` completes a
+     *redirect* login when it sees `code=`. Loaded in the renew iframe that page
+     would run `signinRedirectCallback()` against a state entry written for the
+     silent flow and fail. Every real SPA ships this file for the same reason. -->
+<script src="./vendor/oidc-client-ts.min.js"></script>
+<script>
+  // No `authority` and no `redirect_uri`: `signinSilentCallback` hands the URL
+  // it was loaded at to `window.parent` and reads nothing else. The settings
+  // that matter — which issuer, which scope — were spent by the frame above
+  // when it opened the iframe, and repeating them here would be two places for
+  // them to drift.
+  //
+  // A `?error=login_required` callback goes up this same path. The error is
+  // *the parent's* to raise, which is why nothing here branches on it and why
+  // loading this page by hand is silent rather than a thrown exception.
+  new oidc.UserManager({ client_id: 'node-spa' })
+    .signinSilentCallback()
+    .catch((err) => console.error('[node-spa] silent callback failed', err))
+</script>

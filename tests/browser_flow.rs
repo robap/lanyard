@@ -2770,3 +2770,424 @@ async fn the_controls_are_rendered_as_plain_forms_with_no_script() {
     assert!(body.contains(">Expire now<"), "{body}");
     assert!(!body.contains("<script"), "no script anywhere on this page");
 }
+
+// ------------------------------------------ prompt=none: six ways to miss --
+
+/// Log in as `persona` for `client_id` on `http`, so the browser it carries
+/// holds a real selection.
+async fn pick(base: &str, http: &reqwest::Client, client_id: &str, persona: &str) {
+    let req = start(
+        base,
+        http,
+        &format!("client_id={client_id}&response_type=code&redirect_uri={ADA_CB}"),
+    )
+    .await;
+    http.post(format!("{base}/_/pick"))
+        .form(&[("req", req.as_str()), ("persona", persona)])
+        .send()
+        .await
+        .unwrap();
+}
+
+/// The `error_description` a `prompt=none` came back with, and the assertion
+/// that it *is* a `login_required` redirect rather than a page.
+async fn refusal(base: &str, http: &reqwest::Client, extra: &str) -> String {
+    let res = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&prompt=none{extra}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 302, "prompt=none never renders");
+    let params = support::query_of(&res);
+    assert_eq!(params["error"], "login_required");
+    let description = params["error_description"].clone();
+    let body = res.text().await.unwrap();
+    assert!(
+        !body.contains("name=\"persona\""),
+        "no picker markup: {body}"
+    );
+    description
+}
+
+/// **Criterion 4 (a)–(e).** Five causes, five sentences. One generic sentence
+/// is true in all five cases and useful in none, because the developer's actual
+/// question is *"did my cookie arrive?"* — and (a) is the `SameSite` diagnosis
+/// this whole phase exists to deliver at the moment of failure.
+#[tokio::test]
+async fn each_way_a_prompt_none_can_miss_says_which_one_it_was() {
+    let base = spawn().await;
+
+    // (a) No cookie at all. A fresh jar is what a cross-site hidden iframe
+    //     looks like from the server's side: indistinguishable, so the sentence
+    //     has to name the iframe as the usual reason rather than assert it.
+    let no_cookie = refusal(&base, &client(), "").await;
+
+    // (b) A session, but its only selection is under a different client_id.
+    let other_app = client();
+    pick(&base, &other_app, "some-other-app", "ada").await;
+    let no_selection = refusal(&base, &other_app, "").await;
+
+    // (c) A selection, and the browser-wide "always ask" toggle on.
+    let asker = client();
+    pick(&base, &asker, "x", "ada").await;
+    asker
+        .post(format!("{base}/_/session"))
+        .form(&[("always_ask", "1")])
+        .send()
+        .await
+        .unwrap();
+    let always_ask = refusal(&base, &asker, "").await;
+
+    // (d) A selection older than the max_age the request will accept. RFC
+    //     literal: the miss needs elapsed time *greater than* max_age.
+    let stale = client();
+    pick(&base, &stale, "x", "ada").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let too_old = refusal(&base, &stale, "&max_age=0").await;
+
+    let all = [&no_cookie, &no_selection, &always_ask, &too_old];
+    for (i, one) in all.iter().enumerate() {
+        for other in all.iter().skip(i + 1) {
+            assert_ne!(one, other, "two causes must not share a sentence");
+        }
+    }
+
+    // (a) is the one that pays for the phase: it has to say the cookie was
+    //     absent, and why a browser would leave it out.
+    assert!(no_cookie.contains("lanyard_session"), "{no_cookie}");
+    assert!(
+        no_cookie.contains("no lanyard_session cookie arrived"),
+        "{no_cookie}"
+    );
+    assert!(no_cookie.contains("iframe"), "{no_cookie}");
+    assert!(no_cookie.contains("SameSite=Lax"), "{no_cookie}");
+    assert!(
+        no_cookie.contains("127.0.0.1") && no_cookie.contains("localhost"),
+        "the two names are the whole rule: {no_cookie}"
+    );
+    // "Usual" is doing real work: a browser that just logged out gets this
+    // sentence too, and leading with the iframe would be the wrong diagnosis
+    // for it. Both other causes are named rather than implied.
+    assert!(no_cookie.contains("logged out"), "{no_cookie}");
+    assert!(no_cookie.contains("restarted"), "{no_cookie}");
+
+    // (b) names the client_id it looked under, because "logged in" is per app.
+    assert!(no_selection.contains("\"x\""), "{no_selection}");
+    assert!(no_selection.contains("no selection"), "{no_selection}");
+
+    // (c) names the toggle and where it lives.
+    assert!(always_ask.contains("always ask"), "{always_ask}");
+    assert!(always_ask.contains("This browser"), "{always_ask}");
+
+    // (d) names both numbers: what was asked for and what exists.
+    assert!(too_old.contains("max_age=0"), "{too_old}");
+    assert!(
+        too_old.contains("1 seconds ago") || too_old.contains("2 seconds ago"),
+        "the age, not just the fact: {too_old}"
+    );
+}
+
+/// (e), the fifth cause, which needs a persona list that can change underneath
+/// a browser — so a real registry over a file rather than the fixed one.
+///
+/// An interactive login falls through to the picker here and is right to;
+/// `prompt=none` cannot, and the sentence has to be actionable rather than the
+/// same shrug the other four used to share.
+#[tokio::test]
+async fn a_selection_naming_a_deleted_persona_says_so_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let users = dir.path().join("users.yaml");
+    std::fs::write(&users, "personas:\n  - id: ada\n    name: Ada Bell\n").unwrap();
+    let base = support::spawn_with_registry(lanyard_cli::registry::Registry::new(
+        lanyard_cli::config::PersonasSource::Default(users.clone()),
+        lanyard_cli::config::LinksSource(dir.path().join("links.yaml")),
+    ))
+    .await;
+
+    let http = client();
+    pick(&base, &http, "x", "ada").await;
+    // Still spendable while the file still names her.
+    let res = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&prompt=none"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("code="),
+        "the selection is good until the file changes"
+    );
+
+    // The file is edited under the browser. Length and mtime both move, which
+    // is what the registry's stamp watches.
+    std::fs::write(&users, "personas:\n  - id: mira\n    name: Mira Okonkwo\n").unwrap();
+
+    let gone = refusal(&base, &http, "").await;
+    assert!(gone.contains("\"ada\""), "name the persona: {gone}");
+    assert!(gone.contains("\"x\""), "and the client_id: {gone}");
+    assert!(
+        gone.contains("no longer resolves"),
+        "say what happened, not just that something did: {gone}"
+    );
+}
+
+/// **Criterion 4 (f).** The sixth cause. `oidc-client-ts` sends no
+/// `id_token_hint` by default (`includeIdTokenInSilentRenew` is `false`), but
+/// an RP that asks for one is asking a real question — *renew the session I
+/// hold, not whatever this browser happens to be logged in as now* — and
+/// answering it with a code for somebody else would be worse than answering
+/// `login_required`.
+///
+/// **The description never echoes the hinted subject.** It goes in a query
+/// string, and a query string goes in browser history: naming the persona this
+/// browser already chose tells the RP nothing it did not watch happen, and
+/// naming the *hinted* one would tell it something it guessed at.
+#[tokio::test]
+async fn an_id_token_hint_for_somebody_else_is_login_required_not_a_code() {
+    let base = spawn().await;
+    let http = client();
+
+    // Logged in as Ada, with an ID token in hand for her and one for Mira.
+    let ada_hint = id_token_for(&base, "ada").await;
+    let mira_hint = id_token_for(&base, "mira").await;
+    pick(&base, &http, "x", "ada").await;
+
+    // Ada's own hint goes through: this is the renew the parameter is for.
+    let res = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&prompt=none&id_token_hint={ada_hint}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("code="),
+        "a hint naming who this browser is logged in as is a renew"
+    );
+
+    // Mira's is not.
+    let mismatch = refusal(&base, &http, &format!("&id_token_hint={mira_hint}")).await;
+    assert!(mismatch.contains("id_token_hint"), "{mismatch}");
+    assert!(
+        !mismatch.contains("mira"),
+        "the hinted subject is never echoed back: {mismatch}"
+    );
+    assert!(
+        mismatch.contains("\"ada\""),
+        "who this browser actually is, which the RP watched it choose: {mismatch}"
+    );
+
+    // And it is distinct from all five of the others.
+    assert_ne!(mismatch, refusal(&base, &client(), "").await);
+
+    // A hint that will not verify is a malformed request, not a failed login:
+    // `login_required` would send the RP off to re-authenticate over a typo.
+    for bad in ["not-a-token", "a.b.c"] {
+        let res = http
+            .get(format!(
+                "{base}/oidc/authorize?client_id=x&response_type=code\
+                 &redirect_uri={ADA_CB}&prompt=none&id_token_hint={bad}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let params = support::query_of(&res);
+        assert_eq!(params["error"], "invalid_request", "{bad}: {params:?}");
+        assert!(
+            params["error_description"].contains("id_token_hint"),
+            "{bad}: {params:?}"
+        );
+    }
+}
+
+/// A real ID token for `persona`, minted the way a login mints one — through
+/// `/authorize`, `/_/pick` and `/oidc/token` — so the hint under test is a
+/// token lanyard actually issued rather than one assembled by a test.
+async fn id_token_for(base: &str, persona: &str) -> String {
+    let http = client();
+    let req = start(
+        base,
+        &http,
+        &format!("client_id=hint-source&response_type=code&redirect_uri={ADA_CB}&scope=openid"),
+    )
+    .await;
+    let res = http
+        .post(format!("{base}/_/pick"))
+        .form(&[("req", req.as_str()), ("persona", persona)])
+        .send()
+        .await
+        .unwrap();
+    let code = support::query_of(&res)["code"].clone();
+    let (status, body) = exchange(
+        base,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", CB),
+            ("client_id", "hint-source"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["id_token"].as_str().unwrap().to_string()
+}
+
+/// **Criterion 10. A test that exists to fail the day somebody hardens the
+/// headers**, in the shape `session.rs`'s cookie test already established.
+///
+/// There is no `X-Frame-Options` and no `Content-Security-Policy` anywhere in
+/// `src/`, so the hidden-iframe renew works *by omission*. That is fine and it
+/// should stay fine — but "by omission" is what a future security-hygiene
+/// commit deletes without noticing, and the symptom would be a silent renew
+/// that stopped working in one browser family first, weeks later, in somebody
+/// else's project. lanyard is served on loopback to its own developer; there is
+/// nobody to clickjack.
+#[tokio::test]
+async fn nothing_on_the_authorize_path_forbids_being_framed() {
+    let base = spawn().await;
+    let http = client();
+    pick(&base, &http, "x", "ada").await;
+
+    let unframeable = |res: &reqwest::Response| -> Option<String> {
+        for header in ["x-frame-options", "content-security-policy"] {
+            if let Some(value) = res.headers().get(header) {
+                return Some(format!("{header}: {value:?}"));
+            }
+        }
+        None
+    };
+
+    // 1. The renew that worked.
+    let ok = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&prompt=none"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 302);
+    assert!(ok.headers()["location"].to_str().unwrap().contains("code="));
+    assert_eq!(
+        unframeable(&ok),
+        None,
+        "a framed renew must be allowed to work"
+    );
+
+    // 2. The renew that did not. An RP reads this one off the iframe's own
+    //    location, which a frame-ancestors policy would stop it ever reaching.
+    let refused = client()
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&prompt=none"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(support::query_of(&refused)["error"], "login_required");
+    assert_eq!(unframeable(&refused), None);
+
+    // 3. The one rejection, rendered. It is invisible inside a hidden iframe
+    //    either way (see the README), but a frame-options header would turn an
+    //    invisible page into a *different* invisible failure — a browser error
+    //    instead of lanyard's, with nothing in `lanyard logs` to match it to.
+    let rendered = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &prompt=none&redirect_uri=http%3A%2F%2Fevil.test%2Fcb"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rendered.status().as_u16(), 400, "the one rejection");
+    assert_eq!(unframeable(&rendered), None);
+}
+
+/// **Criterion 8, pinned in-process.** A renew is not a re-authentication: same
+/// `sub`, **same `auth_time`**, fresh `iat`.
+///
+/// `resolve` hands back `selection.auth_time` rather than `now`, so this pins a
+/// property rather than building one — and it is worth a test because the
+/// failure is silent and slow. An `auth_time` that advanced on every renew
+/// would let an RP's `max_age` check pass for ever without anybody ever
+/// authenticating again, which is the check reading as if it worked.
+#[tokio::test]
+async fn a_renewed_id_token_keeps_auth_time_and_moves_iat() {
+    let base = spawn().await;
+    let http = client();
+
+    let first = login_with(
+        &base,
+        &http,
+        &format!("client_id=x&response_type=code&redirect_uri={ADA_CB}&scope=openid"),
+    )
+    .await;
+    let (status, body) = exchange(
+        &base,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &first),
+            ("redirect_uri", CB),
+            ("client_id", "x"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let original = payload(body["id_token"].as_str().unwrap());
+
+    // `iat` has one-second resolution, so a renew in the same second would make
+    // "different iat" true by accident or false by accident.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let res = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={ADA_CB}&scope=openid&prompt=none"
+        ))
+        .send()
+        .await
+        .unwrap();
+    let renewed_code = support::query_of(&res)["code"].clone();
+    let (status, body) = exchange(
+        &base,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &renewed_code),
+            ("redirect_uri", CB),
+            ("client_id", "x"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let renewed = payload(body["id_token"].as_str().unwrap());
+
+    assert_eq!(renewed["sub"], original["sub"], "same person");
+    assert_eq!(
+        renewed["auth_time"], original["auth_time"],
+        "a renew is not a re-authentication: auth_time is when the human picked"
+    );
+    assert_ne!(
+        renewed["iat"], original["iat"],
+        "and the token itself is new"
+    );
+    assert!(
+        renewed["exp"].as_u64().unwrap() > original["exp"].as_u64().unwrap(),
+        "which is the point of renewing"
+    );
+    assert!(
+        renewed["auth_time"].as_u64().unwrap() < renewed["iat"].as_u64().unwrap(),
+        "auth_time legitimately predates iat, and that is not a bug to be tidied"
+    );
+}

@@ -87,10 +87,18 @@ async fn doctor_against_a_working_setup_is_all_ok_and_exits_zero() {
         !report.contains("FAIL") && !report.contains("WARN"),
         "{report}"
     );
-    assert_eq!(
-        report.lines().count(),
-        7,
-        "one heading and six checks, no more: {report}"
+    // Six checks and no seventh. Counted by the level column rather than by
+    // lines, because a check may hang a consequence — or, on a `127.0.0.1`
+    // issuer, Phase 9's silent-renew note — underneath itself, and those are
+    // explanations of a check rather than checks of their own.
+    let levels = report
+        .lines()
+        .filter(|line| ["OK", "WARN", "FAIL"].iter().any(|l| line.contains(l)))
+        .count();
+    assert_eq!(levels, 6, "one heading and six checks, no more: {report}");
+    assert!(
+        report.lines().skip(1).all(|line| line.starts_with("  ")),
+        "everything under the heading is indented under it: {report}"
     );
 }
 
@@ -241,4 +249,50 @@ async fn a_config_serve_would_refuse_fails_and_names_the_variable() {
         .unwrap();
 
     assert!(!out.status.success());
+}
+
+/// **Phase 9's note, on a real report.** `doctor` knows the resolved issuer and
+/// cannot know what origin a browser app is served from, so the silent-renew
+/// consequence of a `127.0.0.1` issuer is a note under the Issuer line rather
+/// than a check of its own — and it must not turn `OK` into `WARN`, or the
+/// shipped default would warn at every developer who is not building a SPA.
+///
+/// The rule it states was measured before it was written down:
+/// `docs/decisions/silent-renew-over-http.md`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_report_notes_what_a_loopback_ip_issuer_costs_a_silent_renew() {
+    let (base, _bus) = support::spawn_self_consistent().await;
+    let data = tempfile::tempdir().unwrap();
+    lanyard_cli::keys::load_or_create(data.path()).unwrap();
+
+    let out = doctor_env(
+        Some(&base),
+        &[],
+        &[("LANYARD_DATA_DIR", data.path().to_str().unwrap())],
+    );
+    let report = stdout(&out);
+
+    assert!(out.status.success(), "a note is not a failure: {report}");
+    assert!(
+        line(&report, "Issuer").contains("OK"),
+        "and not a warning either: {report}"
+    );
+    assert!(report.contains("prompt=none"), "{report}");
+    assert!(report.contains("cross-site"), "{report}");
+    assert!(
+        report.contains("LANYARD_ISSUER=http://localhost:"),
+        "the fix, with this server's own port: {report}"
+    );
+
+    // `--strict` promotes warnings; a note is not one, so it stays zero.
+    let strict = doctor_env(
+        Some(&base),
+        &["--strict"],
+        &[("LANYARD_DATA_DIR", data.path().to_str().unwrap())],
+    );
+    assert!(
+        strict.status.success(),
+        "a note must not fail --strict: {}",
+        stdout(&strict)
+    );
 }

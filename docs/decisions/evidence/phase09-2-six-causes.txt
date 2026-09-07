@@ -1,0 +1,95 @@
+Phase 9 — the six prompt=none refusals, on the wire.
+
+lanyard 0.1.0 with LANYARD_PERSONAS pointing at a two-persona file, so cause
+(e) can take a persona away underneath a browser that already chose her.
+Six curl calls against a running server, one cookie jar each.
+
+=== (a) no cookie at all ===
+--- (a)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent and no lanyard_session cookie arrived with the request, so lanyard cannot tell who this browser is. The usual reason is a hidden iframe: lanyard's session cookie is SameSite=Lax, and a browser does not send it on a navigation from a site that is not lanyard's own. SameSite compares the host and ignores the port, so an app on http://localhost is same-site to an issuer on http://localhost and cross-site to one on http://127.0.0.1. The other two reasons a cookie goes missing are that this browser logged out of lanyard, and that lanyard restarted — sessions live in memory
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+=== (b) a session whose only selection is under another client_id ===
+--- (b)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent and this browser's lanyard session has no selection for client_id "x". Nobody has picked a person for this application in this browser yet, or it has since logged out of it — selections are held per client_id, so being logged in to another application does not count
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+=== (c) the browser-wide "always ask" toggle ===
+--- (c)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent and this browser has "always ask" turned on, which overrides the selection it holds for client_id "x" and for every other application. The checkbox is on lanyard's own page, under "This browser"
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+=== (d) a selection older than max_age ===
+--- (d)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent with max_age=1, and this browser's selection for client_id "x" was authenticated 2 seconds ago. The request asked for a fresher authentication than exists, and prompt=none is the request not to ask for one
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+=== (f) an id_token_hint naming somebody else ===
+--- (f)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent with an id_token_hint naming a different subject than the one this browser is logged in as for client_id "x", which is persona "ada". OIDC Core §3.1.2.6 says to refuse rather than renew somebody else's session; log in again to switch
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+=== (e) the selection names a persona the file no longer has ===
+--- (e)  HTTP 302
+    error            : login_required
+    error_description: prompt=none was sent and the selection this browser holds for client_id "x" names persona "ada", which no longer resolves for that client_id. It was removed from a personas file, or scoped to a different application
+    picker markup    : 0 occurrences; body 0 bytes
+    X-Frame-Options / CSP: 0 headers
+
+==============================================================================
+Criterion 5 — the same six on `lanyard logs --json`
+==============================================================================
+
+$ lanyard logs --json | jq -r 'select(.error=="login_required") | .error_description'
+
+prompt=none was sent and no lanyard_session cookie arrived with the request, so lanyard cannot tell who this browser is. The usual reason is a hidden iframe: lanyard's session cookie is SameSite=Lax, and a browser does not send it on a navigation from a site that is not lanyard's own. SameSite compares the host and ignores the port, so an app on http://localhost is same-site to an issuer on http://localhost and cross-site to one on http://127.0.0.1. The other two reasons a cookie goes missing are that this browser logged out of lanyard, and that lanyard restarted — sessions live in memory
+
+prompt=none was sent and this browser's lanyard session has no selection for client_id "x". Nobody has picked a person for this application in this browser yet, or it has since logged out of it — selections are held per client_id, so being logged in to another application does not count
+
+prompt=none was sent and this browser has "always ask" turned on, which overrides the selection it holds for client_id "x" and for every other application. The checkbox is on lanyard's own page, under "This browser"
+
+prompt=none was sent with max_age=1, and this browser's selection for client_id "x" was authenticated 2 seconds ago. The request asked for a fresher authentication than exists, and prompt=none is the request not to ask for one
+
+prompt=none was sent with an id_token_hint naming a different subject than the one this browser is logged in as for client_id "x", which is persona "ada". OIDC Core §3.1.2.6 says to refuse rather than renew somebody else's session; log in again to switch
+
+prompt=none was sent and the selection this browser holds for client_id "x" names persona "ada", which no longer resolves for that client_id. It was removed from a personas file, or scoped to a different application
+
+6 distinct sentences.
+
+==============================================================================
+Criterion 10 — nothing on the /authorize path forbids being framed
+==============================================================================
+
+Neither X-Frame-Options nor Content-Security-Policy appears on any of the
+three, which is what makes the hidden-iframe renew possible at all — by
+omission until Phase 9, asserted since.
+
+--- 1. the prompt=none success 302
+    HTTP/1.1 302 Found
+    location: http://localhost:5000/signin-oidc?code=bd292d75c9db44d1ad10f977a1de45cc
+    set-cookie: lanyard_session=fab25141d6934ffeac255eb7b2cfb4d5; Path=/; HttpOnly; SameSite=Lax
+    vary: Origin
+    content-length: 0
+    date: Mon, 07 Sep 2026 02:11:56 GMT
+    
+--- 2. the login_required 302 (error_description elided; it is above verbatim)
+    HTTP/1.1 302 Found
+    location: http://localhost:5000/signin-oidc?error=login_required&error_description=prompt%3Dnone+was
+    vary: Origin
+    content-length: 0
+    date: Mon, 07 Sep 2026 02:11:56 GMT
+    
+--- 3. the rendered 400 for a non-loopback redirect_uri
+    HTTP/1.1 400 Bad Request
+    content-type: text/html; charset=utf-8
+    cache-control: no-store
+    vary: Origin
+    content-length: 1235
+    date: Mon, 07 Sep 2026 02:11:56 GMT
+    
+    <!doctype html>

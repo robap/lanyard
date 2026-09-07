@@ -1,0 +1,101 @@
+Phase 9 — the renewed token is a real token, and nothing earlier regressed.
+
+Chrome for Testing 149.0.7827.55 against lanyard with
+LANYARD_ISSUER=http://localhost:9500/oidc (the same-site row), app at
+http://localhost:5173.
+
+==============================================================================
+Criterion 7 — the renewed access token verifies against the LIVE JWKS
+==============================================================================
+
+`jose` reads jwks_uri out of the discovery document and fetches the key over
+HTTP, exactly as a relying party does. Run the moment the renew lands, because
+a lanyard access token lives 60 seconds.
+
+$ node scripts/jose-verify.mjs <renewed access token> http://localhost:9500/oidc
+{
+  "client_id": "node-spa",
+  "email": "ada@example.test",
+  "email_verified": true,
+  "exp": 1788747238,
+  "iat": 1788747178,
+  "iss": "http://localhost:9500/oidc",
+  "jti": "3ad5c199-0769-4f6f-9f6c-33131a0fb773",
+  "name": "Ada Bell",
+  "nbf": 1788747173,
+  "preferred_username": "ada",
+  "roles": [
+    "admin",
+    "user"
+  ],
+  "scope": "openid email profile",
+  "sub": "ada"
+}
+
+pre-renew  access_token exp: 1788747188
+renewed    access_token exp: 1788747238
+later: true
+
+$ node scripts/jose-verify.mjs <renewed id token> http://localhost:9500/oidc
+{
+  "at_hash": "EmZhLXL__RRTDlBvznCc2g",
+  "aud": "node-spa",
+  "auth_time": 1788747128,
+  "c_hash": "emZnOSE8Ot7Eh5BA4_42aQ",
+  "email": "ada@example.test",
+  "email_verified": true,
+  "exp": 1788747478,
+  "iat": 1788747178,
+  "iss": "http://localhost:9500/oidc",
+  "jti": "e87d7f3c-c4fe-4cd6-ab06-a775e7558cbd",
+  "name": "Ada Bell",
+  "nbf": 1788747173,
+  "preferred_username": "ada",
+  "roles": [
+    "admin",
+    "user"
+  ],
+  "sub": "ada"
+}
+
+pre-renew id_token: {"sub":"ada","auth_time":1788747128,"iat":1788747128,"exp":1788747428}
+renewed   id_token: {"sub":"ada","auth_time":1788747128,"iat":1788747178,"exp":1788747478}
+
+==============================================================================
+Criterion 9 — a logout is not silently undone by a renew
+==============================================================================
+
+  after mgr.signoutRedirect() the SPA is at: http://localhost:5173/?renew=iframe
+  and renders: node-spa Not signed in. Log in with lanyard That link goes to a page this applic
+  its own automatic renew: refused  (oidc-client-ts stops
+    the renew timer on removeUser, so no iframe fires by itself)
+
+  driving the same navigation the library would have — a real hidden iframe
+  at the identical silent-renew URL, same browser, same cookie jar:
+    Sec-Fetch-Dest: iframe
+    Cookie: (no Cookie header — the logout cleared it)
+    <- 302
+    error: login_required
+    error_description: prompt=none was sent and no lanyard_session cookie arrived with the request, so lanyard cannot tell who this browser is. The usual reason is a hidden iframe: lanyard's session cookie is SameSite=Lax, and a browser does not send it on a navigation from a site that is not lanyard's own. SameSite compares the host and ignores the port, so an app on http://localhost is same-site to an issuer on http://localhost and cross-site to one on http://127.0.0.1. The other two reasons a cookie goes missing are that this browser logged out of lanyard, and that lanyard restarted — sessions live in memory
+
+==============================================================================
+Criteria 11 and 13 — the refresh-token path and the plain redirect login
+==============================================================================
+
+The same page with no ?renew=iframe. Phase 5's criterion, re-run.
+
+  URL after the login completes : http://localhost:5173/
+  <main> elements rendered      : 1   (the shared page, once)
+  <h1>                          : 'node-spa'
+  page                          : node-spa Signed in as ada@example.test. Log out Clear this a
+  refresh token held            : True
+
+  renewed                       : True
+  console                       : ['[log] [node-spa] access token renewed, expires in 60 seconds']
+  GET /oidc/authorize requests  : 0
+  requests with Sec-Fetch-Dest: iframe : 0
+  POST /oidc/token              : [{'method': 'POST', 'status': 200}]
+
+  and lanyard's own log for that renew names the grant:
+
+    02:16:00  node-spa      POST /oidc/token            200   99ms  refresh_token  sub=ada  exp=+60s  scope=openid,email,profile,offline_access

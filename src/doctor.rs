@@ -385,12 +385,18 @@ pub fn issuer_check(
         consequence
     };
 
+    // **A note, and never a level.** See [`silent_renew_note`]: `doctor` cannot
+    // know what origin a browser app is served from, so appending it must not
+    // turn the shipped default into a `WARN` at every developer who is not
+    // building a SPA.
+    let note = silent_renew_note(&discovery.issuer);
+
     let here = crate::hosts::authority_of(dialled).unwrap_or(dialled);
     let there = crate::hosts::authority_of(&discovery.issuer).unwrap_or(&discovery.issuer);
     if here.eq_ignore_ascii_case(there) {
         let agreed = "the running server agrees with the address I dialled";
         let consequence = also_reached(Vec::new());
-        return if consequence.is_empty() {
+        let mut check = if consequence.is_empty() {
             Check::ok("Issuer", agreed)
         } else {
             Check::warn(
@@ -399,6 +405,8 @@ pub fn issuer_check(
                 consequence,
             )
         };
+        check.consequence.extend(note);
+        return check;
     }
 
     let mut consequence = vec![format!(
@@ -420,11 +428,50 @@ pub fn issuer_check(
         discovery.issuer.replacen(there, here, 1)
     ));
 
+    let mut consequence = also_reached(consequence);
+    consequence.extend(note);
     Check::warn(
         "Issuer",
         format!("the server says {there}, I dialled {here}"),
-        also_reached(consequence),
+        consequence,
     )
+}
+
+/// **What a loopback-IP issuer costs a browser app, said once, as a note.**
+///
+/// `SameSite` compares scheme and host and **ignores the port**, so an app
+/// served from `http://localhost:5173` is *same-site* to an issuer on
+/// `http://localhost:9500` and *cross-site* to one on `http://127.0.0.1:9500`
+/// — and lanyard's `Lax` session cookie does not ride a cross-site iframe
+/// navigation. A hidden-iframe silent renew (`prompt=none`) therefore gets
+/// `login_required` on the shipped default, which is the row measured in
+/// `docs/decisions/silent-renew-over-http.md`.
+///
+/// **A note rather than a check**, because `doctor` knows the issuer and cannot
+/// know the app's origin: an app also served from `127.0.0.1` is same-site to
+/// this issuer and perfectly fine, and a project with no browser app at all is
+/// unaffected. It never changes the level for the same reason. Phase 8
+/// established that `doctor` is where this class of naming problem gets
+/// explained; this is the same fact one layer out.
+fn silent_renew_note(issuer: &str) -> Option<String> {
+    let url = url::Url::parse(issuer).ok()?;
+    // The *literal* loopback addresses only. A `Domain` host is `localhost`, or
+    // a container service name, or something else nobody here can reason about
+    // — and `localhost` is the row that works.
+    let host = match url.host()? {
+        url::Host::Ipv4(v4) if v4.is_loopback() => v4.to_string(),
+        url::Host::Ipv6(v6) if v6.is_loopback() => v6.to_string(),
+        _ => return None,
+    };
+    let mut fixed = url.clone();
+    fixed.set_host(Some("localhost")).ok()?;
+    Some(format!(
+        "The issuer host is {host}; a browser app served from http://localhost is \
+         cross-site to it — SameSite compares the host and ignores the port — so a \
+         hidden-iframe silent renew (prompt=none) will not be sent lanyard's session \
+         cookie. If that app is yours: LANYARD_ISSUER={fixed} lanyard serve",
+        fixed = fixed.as_str().trim_end_matches('/'),
+    ))
 }
 
 fn port_of(authority: &str) -> Option<&str> {
@@ -904,12 +951,74 @@ mod tests {
     #[test]
     fn an_issuer_that_agrees_with_the_address_dialled_is_ok() {
         let check = issuer_check(
-            "http://127.0.0.1:9500",
-            &Ok(discovery("http://127.0.0.1:9500/oidc")),
+            "http://localhost:9500",
+            &Ok(discovery("http://localhost:9500/oidc")),
             &[],
         );
         assert_eq!(check.level, Level::Ok);
         assert!(check.consequence.is_empty());
+    }
+
+    /// **Phase 9's note.** `doctor` knows the issuer and cannot know what origin
+    /// a browser app is served from, so this states a consequence rather than
+    /// reaching a verdict — and it must not change the level, or the shipped
+    /// default would print a `WARN` at every developer for a configuration that
+    /// is only wrong if they happen to be building a SPA.
+    ///
+    /// Measured before it was written down:
+    /// `docs/decisions/silent-renew-over-http.md`.
+    #[test]
+    fn a_loopback_ip_issuer_notes_what_it_costs_a_silent_renew() {
+        let check = issuer_check(
+            "http://127.0.0.1:9500",
+            &Ok(discovery("http://127.0.0.1:9500/oidc")),
+            &[],
+        );
+        assert_eq!(check.level, Level::Ok, "a note is not a verdict");
+
+        let said = check.consequence.join(" ");
+        assert!(said.contains("127.0.0.1"), "{said}");
+        assert!(said.contains("localhost"), "{said}");
+        assert!(said.contains("cross-site"), "{said}");
+        assert!(said.contains("prompt=none"), "{said}");
+        assert!(
+            said.contains("LANYARD_ISSUER=http://localhost:9500/oidc"),
+            "the fix, with this issuer's own port: {said}"
+        );
+    }
+
+    /// And the row that works says nothing, because there is nothing to say.
+    #[test]
+    fn a_localhost_issuer_gets_no_silent_renew_note() {
+        for issuer in ["http://localhost:9500/oidc", "http://lanyard:9500/oidc"] {
+            let check = issuer_check("http://localhost:9500", &Ok(discovery(issuer)), &[]);
+            assert!(
+                !check.consequence.join(" ").contains("prompt=none"),
+                "{issuer}: {:?}",
+                check.consequence
+            );
+        }
+    }
+
+    /// The note rides on a mismatch too — a developer whose ports disagree is
+    /// no less likely to be running a SPA.
+    #[test]
+    fn the_silent_renew_note_survives_an_issuer_mismatch() {
+        let check = issuer_check(
+            "http://localhost:9500",
+            &Ok(discovery("http://127.0.0.1:8080/oidc")),
+            &[],
+        );
+        assert_eq!(check.level, Level::Warn);
+        let said = check.consequence.join(" ");
+        assert!(
+            said.contains("rejects it"),
+            "the mismatch is still first: {said}"
+        );
+        assert!(
+            said.contains("prompt=none"),
+            "and the note is still there: {said}"
+        );
     }
 
     /// Criterion 8. `-p 9500:8080` is not a separate detector: `doctor` dialled

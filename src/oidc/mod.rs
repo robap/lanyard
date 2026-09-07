@@ -6,6 +6,7 @@ pub mod code;
 pub mod cors;
 pub mod end_session;
 pub mod flaw;
+pub mod hint;
 pub mod introspect;
 pub mod issue;
 pub mod jws;

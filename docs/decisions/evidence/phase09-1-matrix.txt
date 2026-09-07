@@ -1,0 +1,147 @@
+Phase 9 — silent renew in a hidden iframe, measured.
+
+App:      http://localhost:5173/?renew=iframe   (spikes/node-spa, python3 -m http.server)
+Library:  oidc-client-ts 3.4.0, automaticSilentRenew, no offline_access -> no refresh token
+Browsers: Google Chrome for Testing 149.0.7827.55 / Mozilla Firefox 152.0.4
+lanyard:  0.1.0, bound 127.0.0.1:9500, LANYARD_ISSUER set per row.
+
+Only two things change between the rows: LANYARD_ISSUER, and the matching
+`authority` in index.html. The renew is never provoked from a console —
+each cell logs in and waits for accessTokenExpiringNotificationTimeInSeconds
+to fire on a 60-second access token.
+
+==============================================================================
+same-site / chrome   issuer http://localhost:9500/oidc
+==============================================================================
+
+  the hidden iframe navigates to /authorize:
+    GET http://localhost:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=5e855016d3664856a410285d1549ede6&code_challenge=ulqH16mFv_FgR6d8AR6L9gqLxccKcSD5nRvu-wYWLZ0&code_challenge_method=S256&prompt=none
+    Sec-Fetch-Dest: iframe
+    Sec-Fetch-Site: same-site
+    Cookie: lanyard_session=e8a9e516cb33434483b3781ed7e98958
+
+  <- HTTP 302
+    Location: http://localhost:5173/silent-callback.html?code=94a40b579f1446d4851713dca3fcdbcc&state=5e855016d3664856a410285d1549ede6
+
+  the callback page loads at: http://localhost:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=5e855016d3664856a410285d1549ede6&code_challenge=ulqH16mFv_FgR6d8AR6L9gqLxccKcSD5nRvu-wYWLZ0&code_challenge_method=S256&prompt=none
+  the callback page loads at: http://localhost:5173/silent-callback.html?code=94a40b579f1446d4851713dca3fcdbcc&state=5e855016d3664856a410285d1549ede6
+  POST /oidc/token: POST -> 200
+
+  console:
+    [log] [node-spa] access token renewed, expires in 60 seconds
+
+  address bar: unchanged (http://localhost:5173/?renew=iframe)
+  renewed: true
+
+  id_token, original login vs renew:
+    sub        ada  ->  ada          same
+    auth_time  1788746837  ->  1788746837   same
+    iat        1788746837  ->  1788746887   different
+  access_token exp  1788746897  ->  1788746947   later
+
+==============================================================================
+same-site / firefox   issuer http://localhost:9500/oidc
+==============================================================================
+
+  the hidden iframe navigates to /authorize:
+    GET http://localhost:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=0b2912c06f2443b69d4c6f7b340dcea1&code_challenge=RlsGcnLR_C4nxEOYDERyK8XunrSo3gxUWbKB-VIzopU&code_challenge_method=S256&prompt=none
+    Sec-Fetch-Dest: iframe
+    Sec-Fetch-Site: same-site
+    Cookie: lanyard_session=29e3c8ec224d4e7e87daa86b2d74c51d
+
+  <- HTTP 302
+    Location: http://localhost:5173/silent-callback.html?code=0593af16722a404b9daa0b4b461480df&state=0b2912c06f2443b69d4c6f7b340dcea1
+
+  the callback page loads at: http://localhost:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=0b2912c06f2443b69d4c6f7b340dcea1&code_challenge=RlsGcnLR_C4nxEOYDERyK8XunrSo3gxUWbKB-VIzopU&code_challenge_method=S256&prompt=none
+  the callback page loads at: http://localhost:5173/silent-callback.html?code=0593af16722a404b9daa0b4b461480df&state=0b2912c06f2443b69d4c6f7b340dcea1
+  POST /oidc/token: POST -> 200
+
+  console:
+    [log] [node-spa] access token renewed, expires in 60 seconds
+
+  address bar: unchanged (http://localhost:5173/?renew=iframe)
+  renewed: true
+
+  id_token, original login vs renew:
+    sub        ada  ->  ada          same
+    auth_time  1788746893  ->  1788746893   same
+    iat        1788746893  ->  1788746943   different
+  access_token exp  1788746953  ->  1788747003   later
+
+==============================================================================
+cross-site / chrome   issuer http://127.0.0.1:9500/oidc
+==============================================================================
+
+  the hidden iframe navigates to /authorize:
+    GET http://127.0.0.1:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=fb653be8eda94c9bb68e28cc2a9d6989&code_challenge=ResZ94fv163XBlWXRwH7Bkbt77irCh-iiiW-s2fgbmo&code_challenge_method=S256&prompt=none
+    Sec-Fetch-Dest: iframe
+    Sec-Fetch-Site: cross-site
+    Cookie: (no Cookie header on the request)
+
+  <- HTTP 302
+    Location: http://localhost:5173/silent-callback.html?error=login_required&error_description=prompt%3Dnone+was+sent+and+no+lanyard_session+cookie+arrived+with+the+request%2C+so+lanyard+cannot+tell+who+this+browser+is.+The+usual+reason+is+a+hidden+iframe%3A+lanyard%27s+session+cookie+is+SameSite%3DLax%2C+and+a+browser+does+not+send+it+on+a+navigation+from+a+site+that+is+not+lanyard%27s+own.+SameSite+compares+the+host+and+ignores+the+port%2C+so+an+app+on+http%3A%2F%2Flocalhost+is+same-site+to+an+issuer+on+http%3A%2F%2Flocalhost+and+cross-site+to+one+on+http%3A%2F%2F127.0.0.1.+The+other+two+reasons+a+cookie+goes+missing+are+that+this+browser+logged+out+of+lanyard%2C+and+that+lanyard+restarted+%E2%80%94+sessions+live+in+memory&state=fb653be8eda94c9bb68e28cc2a9d6989
+
+  the callback page loads at: http://127.0.0.1:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=fb653be8eda94c9bb68e28cc2a9d6989&code_challenge=ResZ94fv163XBlWXRwH7Bkbt77irCh-iiiW-s2fgbmo&code_challenge_method=S256&prompt=none
+  the callback page loads at: http://localhost:5173/silent-callback.html?error=login_required&error_description=prompt%3Dnone+was+sent+and+no+lanyard_session+cookie+arrived+with+the+request%2C+so+lanyard+cannot+tell+who+this+browser+is.+The+usual+reason+is+a+hidden+iframe%3A+lanyard%27s+session+cookie+is+SameSite%3DLax%2C+and+a+browser+does+not+send+it+on+a+navigation+from+a+site+that+is+not+lanyard%27s+own.+SameSite+compares+the+host+and+ignores+the+port%2C+so+an+app+on+http%3A%2F%2Flocalhost+is+same-site+to+an+issuer+on+http%3A%2F%2Flocalhost+and+cross-site+to+one+on+http%3A%2F%2F127.0.0.1.+The+other+two+reasons+a+cookie+goes+missing+are+that+this+browser+logged+out+of+lanyard%2C+and+that+lanyard+restarted+%E2%80%94+sessions+live+in+memory&state=fb653be8eda94c9bb68e28cc2a9d6989
+  POST /oidc/token: (never reached)
+
+  console:
+    [error] [node-spa] renew failed: prompt=none was sent and no lanyard_session cookie arrived with the request, so lanyard cannot tell who this browser is. The usual reason is a hidden iframe: lanyard's session cookie is SameSite=Lax, and a browser does not send it on a navigation from a site that is not lanyard's own. SameSite compares the host and ignores the port, so an app on http://localhost is same-site to an issuer on http://localhost and cross-site to one on http://127.0.0.1. The other two reasons a cookie goes missing are that this browser logged out of lanyard, and that lanyard restarted — sessions live in memory
+
+  address bar: unchanged (http://localhost:5173/?renew=iframe)
+  renewed: false
+
+==============================================================================
+cross-site / firefox   issuer http://127.0.0.1:9500/oidc
+==============================================================================
+
+  the hidden iframe navigates to /authorize:
+    GET http://127.0.0.1:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=10d1f64731594ac9bfa97926aad33ec3&code_challenge=Wf7G4i5BCO24eBTZHVOHd5Da3by_B31n1DeNZG5Pleo&code_challenge_method=S256&prompt=none
+    Sec-Fetch-Dest: iframe
+    Sec-Fetch-Site: cross-site
+    Cookie: (no Cookie header on the request)
+
+  <- HTTP 302
+    Location: http://localhost:5173/silent-callback.html?error=login_required&error_description=prompt%3Dnone+was+sent+and+no+lanyard_session+cookie+arrived+with+the+request%2C+so+lanyard+cannot+tell+who+this+browser+is.+The+usual+reason+is+a+hidden+iframe%3A+lanyard%27s+session+cookie+is+SameSite%3DLax%2C+and+a+browser+does+not+send+it+on+a+navigation+from+a+site+that+is+not+lanyard%27s+own.+SameSite+compares+the+host+and+ignores+the+port%2C+so+an+app+on+http%3A%2F%2Flocalhost+is+same-site+to+an+issuer+on+http%3A%2F%2Flocalhost+and+cross-site+to+one+on+http%3A%2F%2F127.0.0.1.+The+other+two+reasons+a+cookie+goes+missing+are+that+this+browser+logged+out+of+lanyard%2C+and+that+lanyard+restarted+%E2%80%94+sessions+live+in+memory&state=10d1f64731594ac9bfa97926aad33ec3
+
+  the callback page loads at: http://127.0.0.1:9500/oidc/authorize?client_id=node-spa&redirect_uri=http%3A%2F%2Flocalhost%3A5173%2Fsilent-callback.html&response_type=code&scope=openid+email+profile&state=10d1f64731594ac9bfa97926aad33ec3&code_challenge=Wf7G4i5BCO24eBTZHVOHd5Da3by_B31n1DeNZG5Pleo&code_challenge_method=S256&prompt=none
+  the callback page loads at: http://localhost:5173/silent-callback.html?error=login_required&error_description=prompt%3Dnone+was+sent+and+no+lanyard_session+cookie+arrived+with+the+request%2C+so+lanyard+cannot+tell+who+this+browser+is.+The+usual+reason+is+a+hidden+iframe%3A+lanyard%27s+session+cookie+is+SameSite%3DLax%2C+and+a+browser+does+not+send+it+on+a+navigation+from+a+site+that+is+not+lanyard%27s+own.+SameSite+compares+the+host+and+ignores+the+port%2C+so+an+app+on+http%3A%2F%2Flocalhost+is+same-site+to+an+issuer+on+http%3A%2F%2Flocalhost+and+cross-site+to+one+on+http%3A%2F%2F127.0.0.1.+The+other+two+reasons+a+cookie+goes+missing+are+that+this+browser+logged+out+of+lanyard%2C+and+that+lanyard+restarted+%E2%80%94+sessions+live+in+memory&state=10d1f64731594ac9bfa97926aad33ec3
+  POST /oidc/token: (never reached)
+
+  console:
+    [error] [node-spa] renew failed: prompt=none was sent and no lanyard_session cookie arrived with the request, so lanyard cannot tell who this browser is. The usual reason is a hidden iframe: lanyard's session cookie is SameSite=Lax, and a browser does not send it on a navigation from a site that is not lanyard's own. SameSite compares the host and ignores the port, so an app on http://localhost is same-site to an issuer on http://localhost and cross-site to one on http://127.0.0.1. The other two reasons a cookie goes missing are that this browser logged out of lanyard, and that lanyard restarted — sessions live in memory
+
+  address bar: unchanged (http://localhost:5173/?renew=iframe)
+  renewed: false
+
+==============================================================================
+THE COUNTERFACTUAL — what SameSite=None; Secure would have done
+==============================================================================
+
+Run once on a throwaway patch to src/session.rs, reverted immediately. It is
+here so the decision not to flip the cookie rests on a measurement rather than
+on an assumption about how browsers treat http://localhost.
+
+  set_cookie: lanyard_session=<id>; Path=/; HttpOnly; SameSite=None; Secure
+  issuer:     http://127.0.0.1:9500/oidc   (the CROSS-SITE row)
+  app:        http://localhost:5173/?renew=iframe
+
+--- chrome
+    Sec-Fetch-Site: cross-site
+    Cookie: lanyard_session=5d77779ddfa243d58e4c29bb06b8f106
+    <- 302 http://localhost:5173/silent-callback.html?code=dbc7a5448cc947e2baac4ddfa51348a2&state=2ecb9f04db234f3fa46ea7990ad447aa
+    renewed: true
+
+--- firefox
+    Sec-Fetch-Site: cross-site
+    Cookie: lanyard_session=85a3cb96782a43298599f964606a554f
+    <- 302 http://localhost:5173/silent-callback.html?code=dac415529f8b4e35932126762c2afdae&state=69cf707ecaa343b0be97d6d4d9154800
+    renewed: true
+
+So: the browser DOES store and send a Secure cookie set over plain HTTP on
+loopback, and the cross-site row renews. Flipping the cookie would "work".
+It is still refused — north star 4, and Phase 0 obligation #1: a cookie that
+claims Secure while lanyard serves http:// is one that silently stops being
+sent the day the deployment changes, with nothing anywhere saying why.
+src/session.rs::the_cookie_is_never_secure_and_never_expires is the guard,
+and it still passes.

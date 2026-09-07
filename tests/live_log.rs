@@ -947,3 +947,179 @@ async fn refresh(client: &reqwest::Client, base: &str, token: &str) -> reqwest::
         .await
         .unwrap()
 }
+
+// ------------------------------- prompt=none: the six causes, on the log --
+
+/// **Criterion 5.** The five `login_required` sentences a `prompt=none` can
+/// come back with reach `lanyard logs --json` verbatim, because
+/// `redirect_error` already calls `attach` — so the RP's query string and the
+/// developer's terminal are reading the same string. No new plumbing; the
+/// strings got better and the log got better with them.
+///
+/// This matters more here than for the other errors on this page: the RP that
+/// receives one is a hidden iframe, and the developer will never see its query
+/// string. The log is where these are actually read.
+#[tokio::test]
+async fn every_prompt_none_refusal_reaches_the_log_with_its_own_sentence() {
+    let dir = tempfile::tempdir().unwrap();
+    let users = dir.path().join("users.yaml");
+    std::fs::write(
+        &users,
+        "personas:\n  - id: ada\n    name: Ada Bell\n  - id: mira\n    name: Mira Okonkwo\n",
+    )
+    .unwrap();
+    let (base, events) = support::spawn_observed_registry(
+        lanyard_cli::registry::Registry::new(
+            lanyard_cli::config::PersonasSource::Default(users.clone()),
+            lanyard_cli::config::LinksSource(dir.path().join("links.yaml")),
+        ),
+        lanyard_cli::store::Stores::default(),
+    )
+    .await;
+
+    let cb = support::ADA_CB;
+    let none = |http: reqwest::Client, base: String, extra: &'static str| async move {
+        http.get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={cb}&prompt=none{extra}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    };
+    let pick = |http: reqwest::Client, base: String, client_id: &'static str| async move {
+        let res = http
+            .get(format!(
+                "{base}/oidc/authorize?client_id={client_id}&response_type=code\
+                 &redirect_uri={cb}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let location = res.headers()["location"].to_str().unwrap().to_owned();
+        let req = location.split("req=").nth(1).unwrap().to_owned();
+        http.post(format!("{base}/_/pick"))
+            .form(&[("req", req.as_str()), ("persona", "ada")])
+            .send()
+            .await
+            .unwrap();
+    };
+
+    // (a) no cookie
+    none(support::client(), base.clone(), "").await;
+
+    // (b) a session whose only selection is under another client_id
+    let other = support::client();
+    pick(other.clone(), base.clone(), "some-other-app").await;
+    none(other, base.clone(), "").await;
+
+    // (c) "always ask"
+    let asker = support::client();
+    pick(asker.clone(), base.clone(), "x").await;
+    asker
+        .post(format!("{base}/_/session"))
+        .form(&[("always_ask", "1")])
+        .send()
+        .await
+        .unwrap();
+    none(asker, base.clone(), "").await;
+
+    // (d) older than max_age
+    let stale = support::client();
+    pick(stale.clone(), base.clone(), "x").await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    none(stale, base.clone(), "&max_age=0").await;
+
+    // (f) an id_token_hint naming somebody other than the remembered selection.
+    //     Done before (e), because (e) is what takes Mira's browser away.
+    let hint = mira_id_token(&base).await;
+    let hinted = support::client();
+    pick(hinted.clone(), base.clone(), "x").await;
+    hinted
+        .get(format!(
+            "{base}/oidc/authorize?client_id=x&response_type=code\
+             &redirect_uri={cb}&prompt=none&id_token_hint={hint}"
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // (e) a selection naming somebody the file no longer has
+    let orphan = support::client();
+    pick(orphan.clone(), base.clone(), "x").await;
+    std::fs::write(&users, "personas:\n  - id: mira\n    name: Mira Okonkwo\n").unwrap();
+    none(orphan, base.clone(), "").await;
+
+    let seen: Vec<String> = logged(&events)
+        .into_iter()
+        .filter(|e| e.error.as_deref() == Some("login_required"))
+        .filter_map(|e| e.error_description)
+        .collect();
+
+    assert_eq!(seen.len(), 6, "six refusals, six events: {seen:#?}");
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!(distinct.len(), 6, "and six different sentences: {seen:#?}");
+
+    // The one a developer actually needs, spelled out — this is the sentence
+    // that turns a third hour in the network tab into a first minute.
+    assert!(
+        seen.iter()
+            .any(|s| s.contains("no lanyard_session cookie arrived") && s.contains("iframe")),
+        "{seen:#?}"
+    );
+    // And the four that name the thing to go and change.
+    assert!(
+        seen.iter()
+            .any(|s| s.contains("no selection for client_id \"x\"")),
+        "{seen:#?}"
+    );
+    assert!(seen.iter().any(|s| s.contains("always ask")), "{seen:#?}");
+    assert!(seen.iter().any(|s| s.contains("max_age=0")), "{seen:#?}");
+    assert!(
+        seen.iter().any(|s| s.contains("names persona \"ada\"")),
+        "{seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|s| s.contains("id_token_hint")),
+        "{seen:#?}"
+    );
+}
+
+/// An ID token lanyard really issued, for somebody who is not the browser under
+/// test — the `id_token_hint` for cause (f).
+async fn mira_id_token(base: &str) -> String {
+    let http = support::client();
+    let res = http
+        .get(format!(
+            "{base}/oidc/authorize?client_id=hint-source&response_type=code\
+             &redirect_uri={}&scope=openid",
+            support::ADA_CB
+        ))
+        .send()
+        .await
+        .unwrap();
+    let location = res.headers()["location"].to_str().unwrap().to_owned();
+    let req = location.split("req=").nth(1).unwrap().to_owned();
+    let res = http
+        .post(format!("{base}/_/pick"))
+        .form(&[("req", req.as_str()), ("persona", "mira")])
+        .send()
+        .await
+        .unwrap();
+    let code = support::query_of(&res)["code"].clone();
+    let body: serde_json::Value = support::client()
+        .post(format!("{base}/oidc/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", "http://localhost:5000/signin-oidc"),
+            ("client_id", "hint-source"),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["id_token"].as_str().expect("an id_token").to_string()
+}

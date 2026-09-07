@@ -10,6 +10,60 @@ python3 -m http.server 5173            # from this directory
 open http://localhost:5173/
 ```
 
+## Two renews, one page
+
+`automaticSilentRenew` has two mechanisms behind it and this spike runs both.
+Which one it takes is decided by a single scope, so the toggle is a single query
+parameter:
+
+| URL | scope | how it renews | evidence for |
+|---|---|---|---|
+| `http://localhost:5173/` | `… offline_access` | `POST /oidc/token`, `grant_type=refresh_token` | Phase 5 |
+| `http://localhost:5173/?renew=iframe` | no `offline_access` | hidden `<iframe>` at `/authorize?prompt=none` | Phase 9 |
+
+**Without `offline_access` there is no refresh token**, and `oidc-client-ts`
+falls back to the iframe. Everything else — the manager, the page, the picker,
+the logout links — is the same code on both paths, which is the point: the
+difference a developer actually has to reason about is one word in `scope`.
+
+The toggle rides on `redirect_uri` and `post_logout_redirect_uri` too
+(`http://localhost:5173/?renew=iframe`), so it survives the round trip through
+lanyard. That works with no registration step for the same reason the port does:
+lanyard's one rejection is about the redirect's **host**, and nothing else.
+
+### The iframe path needs a callback page of its own
+
+`silent_redirect_uri` **defaults to `redirect_uri`** — which here is `/`, whose
+script completes a *redirect* login the moment it sees `code=`. Loaded inside
+the renew iframe it would run `signinRedirectCallback()` against a state entry
+written for the silent flow and fail. `silent-callback.html` exists for that,
+calls `signinSilentCallback()` and nothing else, and renders nothing:
+
+```
+$ open 'http://localhost:5173/silent-callback.html?code=abc&state=x'   # blank, silent
+$ open 'http://localhost:5173/?code=abc&state=x'                       # FAILED: No matching state found in storage
+```
+
+Every real SPA ships this file. The trap is that it *looks* optional.
+
+### Running the iframe path against both of lanyard's names
+
+`SameSite` compares scheme and host and **ignores the port**, so which of
+lanyard's two loopback names the SPA dials decides whether the hidden iframe is
+same-site or cross-site — and the shipped default is the cross-site one:
+
+```
+# same-site: app on localhost, lanyard's issuer on localhost
+LANYARD_ISSUER=http://localhost:9500/oidc lanyard serve &
+#   … and set `authority` in index.html to match.
+
+# cross-site: the stock issuer, app still on localhost
+lanyard serve &
+```
+
+What each of those does to the iframe's `Cookie` header is measured, not
+assumed: [`docs/decisions/silent-renew-over-http.md`](../../docs/decisions/silent-renew-over-http.md).
+
 **The only lanyard-side setup was starting it.** There is no client
 registration step, no redirect allowlist to add `http://localhost:5173/` to,
 and no secret to copy anywhere. `client_id: 'node-spa'` was invented in
@@ -44,6 +98,12 @@ property criterion 29 asks of lanyard itself.
   `accessTokenExpiringNotificationTimeInSeconds` is lowered to 10 because the
   default is 60 and lanyard's access token *lives* 60 — at the default the
   renew would fire the instant the token arrived, or never.
+- **A renew in a hidden iframe** (`?renew=iframe`). No refresh token, so
+  `signinSilent()` navigates an invisible frame to `/authorize?prompt=none` and
+  the whole question is whether the browser attaches `lanyard_session` to it.
+  The address bar still never moves. This is the one login path that cannot be
+  tested with `curl`, because only a browser decides what a third-party iframe
+  navigation carries.
 - **`mgr.signoutRedirect()` ends both sessions.** It reads
   `end_session_endpoint` out of the discovery document; no lanyard URL appears
   in `index.html`. Afterwards the refresh token it was holding reads

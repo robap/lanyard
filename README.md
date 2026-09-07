@@ -483,6 +483,7 @@ the three.
 | `code_challenge` / `code_challenge_method` | `S256` or `plain`. An omitted method is `plain` (RFC 7636). Absent means no PKCE |
 | `prompt` | `login`, `select_account`, `none`, or absent. Anything else is ignored |
 | `max_age` | Compared against the remembered selection's `auth_time` |
+| `id_token_hint` | **Only read on `prompt=none`.** Signature and `iss` are checked, `exp` deliberately is not — a hint is expected to be expired. A `sub` that is not the remembered selection's gets `login_required`; a hint that will not verify gets `invalid_request` |
 | `audience` / `resource` | Becomes the **access token's** `aud`, as on the `client_credentials` grant |
 | `client_secret` | Accepted anywhere it is offered and checked nowhere |
 | anything else | Ignored |
@@ -615,10 +616,62 @@ The picker appears anyway when "always ask" is set, when `prompt=login` or
 `prompt=select_account` is sent, or when `max_age` is sent and the remembered
 selection is older than it. `prompt=none` **renders nothing, ever** — it returns
 a code if there is a usable remembered selection and redirects with
-`error=login_required` if there is not. That is not a claim that silent renew
-works: lanyard's `Lax` cookie is not sent on a third-party iframe navigation, so
-a real SPA renew will get `login_required`. It is a promise that lanyard never
-puts a login screen somewhere nobody can click it.
+`error=login_required` if there is not. A picker inside a hidden iframe is a
+login screen nobody can click.
+
+### Silent renew, and the one rule that decides whether it works
+
+A SPA with no refresh token renews in a **hidden iframe** pointed at
+`/authorize?…&prompt=none`. Whether that works over plain HTTP comes down to one
+thing: **does the browser send lanyard's session cookie on that navigation?**
+
+lanyard's cookie is `SameSite=Lax`, and `SameSite` compares the scheme and the
+**host** and **ignores the port**. So:
+
+| your app | lanyard's issuer | | silent renew |
+|---|---|---|---|
+| `http://localhost:5173` | `http://localhost:9500` | same site | **works** |
+| `http://127.0.0.1:5173` | `http://127.0.0.1:9500` | same site | **works** |
+| `http://localhost:5173` | `http://127.0.0.1:9500` | two sites | `login_required` |
+| `http://web.localtest.me:5173` | `http://localhost:9500` | two sites | `login_required` |
+
+**Use the same name on both sides.** The port does not matter and the scheme is
+`http` either way, so this is entirely about spelling `localhost` or `127.0.0.1`
+consistently.
+
+**lanyard's shipped default is `http://127.0.0.1:9500/oidc`**, and most dev
+servers are opened at `http://localhost:<port>` — so out of the box those are
+two sites. Either dial your app at `127.0.0.1`, or start lanyard with:
+
+```
+LANYARD_ISSUER=http://localhost:9500/oidc lanyard serve
+```
+
+`lanyard doctor` prints this as a note under **Issuer** whenever the issuer host
+is a loopback IP address. It cannot know what origin your app is served from, so
+it states the consequence rather than reaching a verdict.
+
+Measured rather than assumed, in Chrome and Firefox, both directions:
+[`docs/decisions/silent-renew-over-http.md`](docs/decisions/silent-renew-over-http.md).
+
+**A renew is not a re-authentication.** The ID token from a `prompt=none` carries
+a fresh `iat` and `exp`, the same `sub`, and the **same `auth_time`** — the
+moment the human actually picked a person. An `auth_time` that advanced on every
+renew would let an RP's `max_age` check pass for ever without anybody
+authenticating again.
+
+**`login_required` says which of six things happened**, because "did my cookie
+arrive?" is the question and one generic sentence answers it for nobody: no
+cookie at all; a cookie with no selection under this `client_id`; "always ask" on;
+a selection older than `max_age`; a selection naming a persona the file no longer
+has; or an `id_token_hint` naming somebody else. The sentence goes back to your
+app in `error_description` **and** into
+[`lanyard logs`](#the-live-request-log) — which is where you will actually read
+it, because an iframe's query string is not somewhere anybody looks.
+
+**lanyard is deliberately frameable.** There is no `X-Frame-Options` and no
+`Content-Security-Policy` on anything, and a test exists whose whole purpose is
+to fail the day somebody adds one.
 
 ## Logging out
 
@@ -1318,6 +1371,30 @@ the diagnosis rather than a guess about which stack is calling.
 
 **.NET: a 60-second token is still accepted six minutes later.** See
 [`ClockSkew`](#read-this-before-you-use-it) above.
+
+**A SPA's silent renew fails with
+`ErrorResponse: prompt=none was sent and no lanyard_session cookie arrived with
+the request…`** — in `oidc-client-ts` that arrives as
+`[node-spa] renew failed: <that sentence>` from `addSilentRenewError`, and in the
+network tab as a `GET /oidc/authorize?…&prompt=none` with `Sec-Fetch-Dest:
+iframe`, **no `Cookie` header**, and a `302` carrying `error=login_required`.
+
+Your app and lanyard are being dialled by two different host names. `SameSite`
+ignores the port but not the host, so `http://localhost:5173` is cross-site to an
+issuer on `http://127.0.0.1:9500` and the `Lax` session cookie does not travel.
+Use one name on both sides — see
+[Silent renew](#silent-renew-and-the-one-rule-that-decides-whether-it-works).
+This is the shipped default's behaviour, not a misconfiguration you introduced.
+
+**A silent renew times out with no network response at all.** No `postMessage`,
+no error, just `silentRequestTimeoutInSeconds` elapsing. That is almost always a
+`redirect_uri` lanyard **refused**: [the one rejection](#the-one-rejection)
+renders a `400` page rather than redirecting, RFC 6749 §4.1.2.1 forbids sending
+an error to an address just declined, and inside a hidden iframe that page is
+invisible. Nothing can be done about it without making the one rejection
+decorative — so **the reason is in [`lanyard logs`](#the-live-request-log)**,
+which will name the host it refused. Check that your `silent_redirect_uri` is on
+`localhost` or `127.0.0.1`.
 
 **"It asks me to pick a persona every single time."** Either "always ask" is on
 in the picker, or your app is sending `prompt=login`, or the cookie is not coming

@@ -29,12 +29,12 @@ use url::Url;
 use crate::app::SharedState;
 use crate::log_detail::{attach, LogDetail};
 use crate::oidc::code::{Challenge, ChallengeMethod, CodeRecord};
+use crate::oidc::hint;
 use crate::oidc::redirect_uri;
 use crate::oidc::scope::Scopes;
 use crate::oidc::token::Form;
 use crate::persona::Persona;
 use crate::session;
-use crate::store::Selection;
 use crate::ui::html;
 
 /// How the authorization response gets back to the RP.
@@ -77,6 +77,11 @@ pub struct AuthRequest {
     pub audience: Option<String>,
     pub prompt: Option<Prompt>,
     pub max_age: Option<u64>,
+    /// **Only read on the `prompt=none` arm.** An interactive login shows the
+    /// picker, where the human is the answer to "is this still you?"; a silent
+    /// one has nobody to ask, which is the whole reason OIDC Core §3.1.2.1 has
+    /// this parameter.
+    pub id_token_hint: Option<String>,
 }
 
 pub fn route() -> axum::routing::MethodRouter<SharedState> {
@@ -165,60 +170,77 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     // observable: three apps on three ports against one instance, and choosing
     // Mira in one does not disturb the Ada the other is logged in as.
     let session_id = session::from_headers(headers);
-    let (remembered, always_ask) = match &session_id {
-        Some(id) => {
-            let sessions = state.stores.sessions.lock().expect("sessions");
-            (
-                sessions.selection(id, &request.client_id).cloned(),
-                sessions.always_ask(id),
-            )
-        }
-        None => (None, false),
-    };
+    let resolution = resolve(state, session_id.as_deref(), &request);
 
-    // A remembered selection is usable only if the browser has not asked to be
-    // asked, the request has not asked to be asked, and it is not older than
-    // the `max_age` the request will accept.
-    let usable = remembered.filter(|selection| {
-        !always_ask
-            && request.prompt != Some(Prompt::Ask)
-            && request.max_age.is_none_or(|max_age| {
-                state.clock.now().saturating_sub(selection.auth_time) <= max_age
-            })
-    });
-
-    // **`prompt=none` renders nothing, ever.** Not because silent renew works
-    // here — lanyard's `Lax` cookie is not sent on a third-party iframe
-    // navigation, so a real SPA renew gets exactly this `login_required` — but
+    // **`prompt=none` renders nothing, ever.** Not because silent renew always
+    // works — a hidden iframe on a site that is not lanyard's sends no cookie,
+    // and gets exactly this `login_required` (Phase 9's measurement) — but
     // because a picker inside a hidden iframe is a login screen nobody can
-    // click, and that is the wrong behavior on day one (spec, open question 6).
+    // click, and that is the wrong behavior on day one (Phase 4's open
+    // question 6).
     //
-    // `always_ask` and a stale `max_age` both land here as `login_required`,
-    // which is the coherent reading: the answer is "you have to ask", and
-    // `prompt=none` is the request not to.
+    // Every non-`Usable` resolution lands here as `login_required`, which is the
+    // coherent reading: the answer is "you have to ask", and `prompt=none` is
+    // the request not to. **Which** of them it was is the whole difference
+    // between a diagnosis and a shrug, so it is the one thing that varies.
     if request.prompt == Some(Prompt::None) {
-        return match usable.and_then(|selection| resolve(state, &request.client_id, &selection)) {
-            Some((persona, auth_time)) => with_optional_cookie(
+        // **An unverifiable hint is `invalid_request`, not `login_required`.**
+        // The difference is what the RP does next: `login_required` sends it off
+        // to re-authenticate a human, which is a long way to travel for a
+        // malformed parameter.
+        let hinted = match request.id_token_hint.as_deref() {
+            None => None,
+            Some(raw) => match hint::subject_of(&state.key, &state.config.issuer, raw) {
+                Ok(subject) => Some(subject),
+                Err(message) => {
+                    return redirect_error(
+                        &request.redirect_uri,
+                        request.state.as_deref(),
+                        "invalid_request",
+                        &message,
+                    )
+                }
+            },
+        };
+
+        // The hint only ever *downgrades* a resolution — it cannot rescue one,
+        // because a browser with no session is not somebody else, it is nobody.
+        let resolution = match (&resolution, &hinted) {
+            (Resolution::Usable(persona, _), Some(subject)) if subject != &persona.id => {
+                Resolution::HintMismatch {
+                    persona_id: persona.id.clone(),
+                }
+            }
+            _ => resolution,
+        };
+
+        return match resolution {
+            Resolution::Usable(persona, auth_time) => with_optional_cookie(
                 complete(state, request, persona, auth_time, session_id.clone()),
                 session_id,
             ),
-            None => redirect_error(
-                &request.redirect_uri,
-                request.state.as_deref(),
-                "login_required",
-                "prompt=none was sent and this browser has no usable selection for \
-                 this client_id",
-            ),
+            miss => {
+                let description = miss.describe(&request.client_id);
+                redirect_error(
+                    &request.redirect_uri,
+                    request.state.as_deref(),
+                    "login_required",
+                    &description,
+                )
+            }
         };
     }
 
-    if let Some((persona, auth_time)) =
-        usable.and_then(|selection| resolve(state, &request.client_id, &selection))
-    {
-        return with_optional_cookie(
-            complete(state, request, persona, auth_time, session_id.clone()),
-            session_id,
-        );
+    // **Every miss is the picker, and that is deliberate.** Somebody can click
+    // here, so "show them the list" is the right answer to all six causes and
+    // telling them apart would buy nothing.
+    if request.prompt != Some(Prompt::Ask) {
+        if let Resolution::Usable(persona, auth_time) = resolution {
+            return with_optional_cookie(
+                complete(state, request, persona, auth_time, session_id.clone()),
+                session_id,
+            );
+        }
     }
 
     let id = state
@@ -234,20 +256,177 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     found(&format!("/_/?req={id}"))
 }
 
-/// A remembered selection names a persona by id, and the persona list can have
-/// changed under it — a file edited, or lanyard restarted with a different one.
-/// A selection that no longer names anybody falls through to the picker rather
-/// than failing the login.
-/// Scoped by the request's own `client_id`: a persona that has since been
-/// scoped to a *different* application no longer names anybody **for this
-/// login**, and falls through to the picker like any other id that stopped
-/// resolving.
-fn resolve(state: &SharedState, client_id: &str, selection: &Selection) -> Option<(Persona, u64)> {
-    state
+/// Why this browser does or does not have a selection `/authorize` can spend.
+///
+/// One value, six answers. The interactive branch collapses every non-[`Usable`]
+/// variant back into "show the picker", so this enum earns its keep entirely on
+/// the one caller that **cannot ask** — `prompt=none`, whose whole job is to say
+/// which of these happened. Before Phase 9 all of them shared one sentence that
+/// was true in every case and useful in none, because the developer's actual
+/// question is *"did my cookie arrive?"*
+///
+/// [`Usable`]: Resolution::Usable
+#[derive(Debug)]
+enum Resolution {
+    /// A persona, and the time the human actually picked them — which becomes
+    /// `auth_time`, and may legitimately predate this request by hours.
+    Usable(Persona, u64),
+    /// **No `lanyard_session` cookie on the request at all.** The `SameSite`
+    /// symptom, and the reason the other five variants exist: a hidden iframe
+    /// on an origin that is not same-site to lanyard's issuer gets here, and
+    /// nothing else in the request distinguishes it from having logged out.
+    NoCookie,
+    /// A session, but nothing remembered under this `client_id`. Per-`client_id`
+    /// is the multi-project property, so this is the normal state of an app
+    /// nobody has logged in to yet.
+    NoSelection,
+    /// The browser's own "always ask" toggle is on, which overrides every
+    /// remembered selection for every application at once.
+    AlwaysAsk,
+    /// Remembered, but the authentication is older than the `max_age` the
+    /// request said it would accept.
+    TooOld { max_age: u64, age: u64 },
+    /// Remembered and fresh, naming somebody who no longer resolves **for this
+    /// `client_id`** — deleted from a personas file, or scoped to a different
+    /// application since.
+    PersonaGone { persona_id: String },
+    /// Remembered, fresh, resolvable — and **not who the `id_token_hint`
+    /// named**. Only reachable on the `prompt=none` arm, because it is the only
+    /// one that reads the hint.
+    HintMismatch { persona_id: String },
+}
+
+impl Resolution {
+    /// The `error_description` for a `prompt=none` that could not be answered.
+    ///
+    /// Six sentences rather than one, because each names a different fix. They
+    /// travel further than they look: `redirect_error` hands them to the RP's
+    /// own error handler through the query string **and** attaches them to the
+    /// log, so the same sentence reaches `lanyard logs --json`, the SSE stream
+    /// and stdout with no extra plumbing (Phase 6).
+    ///
+    /// **What they deliberately do not say.** These end up in a URL, and a URL
+    /// ends up in browser history — so [`PersonaGone`] names the persona this
+    /// browser already chose, which the RP watched it choose, and the
+    /// `id_token_hint` mismatch never echoes the *hinted* subject back, only
+    /// that it did not match.
+    ///
+    /// [`PersonaGone`]: Resolution::PersonaGone
+    fn describe(&self, client_id: &str) -> String {
+        match self {
+            // Unreachable by construction — the caller matches `Usable` first —
+            // but a description is a description, and a `todo!()` here would be
+            // a panic reachable by a future refactor.
+            Resolution::Usable(..) => {
+                "prompt=none was sent and this browser has a usable selection".to_string()
+            }
+            Resolution::NoCookie => format!(
+                "prompt=none was sent and no {cookie} cookie arrived with the request, so \
+                 lanyard cannot tell who this browser is. The usual reason is a hidden \
+                 iframe: lanyard's session cookie is SameSite=Lax, and a browser does not \
+                 send it on a navigation from a site that is not lanyard's own. \
+                 SameSite compares the host and ignores the port, so an app on \
+                 http://localhost is same-site to an issuer on http://localhost and \
+                 cross-site to one on http://127.0.0.1. The other two reasons a cookie \
+                 goes missing are that this browser logged out of lanyard, and that \
+                 lanyard restarted — sessions live in memory",
+                cookie = session::COOKIE,
+            ),
+            Resolution::NoSelection => format!(
+                "prompt=none was sent and this browser's lanyard session has no selection \
+                 for client_id {client_id:?}. Nobody has picked a person for this \
+                 application in this browser yet, or it has since logged out of it — \
+                 selections are held per client_id, so being logged in to another \
+                 application does not count"
+            ),
+            Resolution::AlwaysAsk => format!(
+                "prompt=none was sent and this browser has \"always ask\" turned on, which \
+                 overrides the selection it holds for client_id {client_id:?} and for every \
+                 other application. The checkbox is on lanyard's own page, under \
+                 \"This browser\""
+            ),
+            Resolution::TooOld { max_age, age } => format!(
+                "prompt=none was sent with max_age={max_age}, and this browser's selection \
+                 for client_id {client_id:?} was authenticated {age} seconds ago. The \
+                 request asked for a fresher authentication than exists, and prompt=none \
+                 is the request not to ask for one"
+            ),
+            Resolution::PersonaGone { persona_id } => format!(
+                "prompt=none was sent and the selection this browser holds for client_id \
+                 {client_id:?} names persona {persona_id:?}, which no longer resolves for \
+                 that client_id. It was removed from a personas file, or scoped to a \
+                 different application"
+            ),
+            // **Says who this browser is, never who the hint asked for.** The
+            // RP watched this browser choose {persona_id} and can see it in
+            // every token it already holds; the subject it hinted at is its own
+            // to compare against, and echoing it into a URL that lands in
+            // browser history would give away somebody it only guessed at.
+            Resolution::HintMismatch { persona_id } => format!(
+                "prompt=none was sent with an id_token_hint naming a different subject than \
+                 the one this browser is logged in as for client_id {client_id:?}, which is \
+                 persona {persona_id:?}. OIDC Core §3.1.2.6 says to refuse rather than renew \
+                 somebody else's session; log in again to switch"
+            ),
+        }
+    }
+}
+
+/// Read the browser's remembered selection and say why it is or is not spendable.
+///
+/// The order the misses are checked in is the order they override each other: no
+/// cookie beats no selection, an explicit "always ask" beats a fresh selection,
+/// and a selection too old to satisfy `max_age` is never looked up in the
+/// persona list at all.
+///
+/// A selection that no longer names anybody is [`Resolution::PersonaGone`]
+/// rather than a failure: the persona list can change under a browser — a file
+/// edited, lanyard restarted with a different one, or Phase 7 scoping that
+/// persona to another `client_id` — and an interactive login falls through to
+/// the picker for it like any other miss.
+fn resolve(state: &SharedState, session_id: Option<&str>, request: &AuthRequest) -> Resolution {
+    let Some(session_id) = session_id else {
+        return Resolution::NoCookie;
+    };
+
+    let (remembered, always_ask) = {
+        let sessions = state.stores.sessions.lock().expect("sessions");
+        (
+            sessions.selection(session_id, &request.client_id).cloned(),
+            sessions.always_ask(session_id),
+        )
+    };
+
+    let Some(selection) = remembered else {
+        return Resolution::NoSelection;
+    };
+    if always_ask {
+        return Resolution::AlwaysAsk;
+    }
+
+    let age = state.clock.now().saturating_sub(selection.auth_time);
+    if let Some(max_age) = request.max_age {
+        // RFC-literal: the picker appears when the elapsed time is *greater
+        // than* `max_age`, so `max_age=0` on a selection made this second is
+        // still fresh.
+        if age > max_age {
+            return Resolution::TooOld { max_age, age };
+        }
+    }
+
+    // Scoped by the request's own `client_id`: a persona that has since been
+    // scoped to a *different* application no longer names anybody **for this
+    // login**.
+    match state
         .personas
         .resolve()
-        .get(&selection.persona_id, Some(client_id))
-        .map(|sourced| (sourced.persona.clone(), selection.auth_time))
+        .get(&selection.persona_id, Some(&request.client_id))
+    {
+        Some(sourced) => Resolution::Usable(sourced.persona.clone(), selection.auth_time),
+        None => Resolution::PersonaGone {
+            persona_id: selection.persona_id,
+        },
+    }
 }
 
 /// Mint the code and hand back the authorization response. Both the picker's
@@ -505,6 +684,9 @@ fn parse(form: &Form) -> Result<AuthRequest, Rejection> {
             _ => None,
         },
         max_age,
+        // Carried raw and verified where it is used: an unverifiable hint is a
+        // refusal with a sentence, and `parse` has no `state` to verify against.
+        id_token_hint: form.get("id_token_hint").map(str::to_string),
     })
 }
 

@@ -8,20 +8,45 @@
      repository's login path reaches a CDN. -->
 <script src="./vendor/oidc-client-ts.min.js"></script>
 <script>
+  // **One page, two renews.** `?renew=iframe` drops `offline_access` and
+  // nothing else, because that one missing scope *is* the difference: holding a
+  // refresh token, `automaticSilentRenew` spends it at `POST /oidc/token` and
+  // never redirects (Phase 5); holding none, it opens a hidden iframe at
+  // `/authorize?prompt=none` (Phase 9). Two mechanisms, one `if`.
+  //
+  // The toggle is URL-only. `spikes/shared/page.html` is byte-identical across
+  // three stacks by design, so a checkbox on it is off the table.
+  const iframeRenew = new URLSearchParams(window.location.search).get('renew') === 'iframe'
+
+  // The toggle rides on both redirect URIs so it survives the round trip
+  // through lanyard — a callback that came back without it would rebuild this
+  // manager in the other mode. lanyard appends `code`/`state` to whatever query
+  // is already there, and its one rejection is about the *host*, so a
+  // redirect_uri with a query string needs no registration either (north star 1).
+  const here = 'http://localhost:5173/' + (iframeRenew ? '?renew=iframe' : '')
+
   const settings = {
     authority: 'http://127.0.0.1:9500/oidc',
     client_id: 'node-spa',
-    redirect_uri: 'http://localhost:5173/',
-    post_logout_redirect_uri: 'http://localhost:5173/',
+    redirect_uri: here,
+    post_logout_redirect_uri: here,
+    // **Named, because the default is a trap.** `silent_redirect_uri` defaults
+    // to `redirect_uri`, and this one is `/` — whose script completes a
+    // *redirect* login the moment it sees `code=`. Inside the renew iframe that
+    // is the wrong callback for the state entry the silent flow wrote, and it
+    // fails. `silent-callback.html` is the page every real SPA ships for this.
+    silent_redirect_uri: 'http://localhost:5173/silent-callback.html',
     response_type: 'code',
     // `offline_access` is what asks lanyard for a refresh token, exactly as
     // `openid` is what asks for an ID token. Without it this SPA gets none and
-    // `automaticSilentRenew` falls back to the iframe path — which is Phase 9's
-    // subject, not this one's.
-    scope: 'openid email profile offline_access',
+    // `automaticSilentRenew` falls back to the iframe path.
+    scope: 'openid email profile' + (iframeRenew ? '' : ' offline_access'),
     // With a refresh token in hand, a renew is a `POST /oidc/token` with
     // `grant_type=refresh_token`: no redirect, no `/authorize`, no iframe, and
-    // the address bar never moves.
+    // the address bar never moves. Without one it is a hidden iframe at
+    // `/authorize?prompt=none` landing on `silent-callback.html`, and the
+    // address bar still never moves — the difference is entirely in whether
+    // lanyard's session cookie rides along.
     automaticSilentRenew: true,
     // The default is 60 seconds, and lanyard's access token *lives* 60 seconds
     // — so the "expiring" event would fire the instant the token arrives, or
@@ -51,7 +76,10 @@
       .join('')
 
     const html = (await template)
-      .replace('{{APP}}', 'node-spa')
+      // `replaceAll`: the shared page names the app twice — in `<title>` and in
+      // the `<h1>` — and a single `replace` filled the title this SPA throws
+      // away and left the heading reading `{{APP}}`.
+      .replaceAll('{{APP}}', 'node-spa')
       .replace('{{WHO}}', escape(user ? (user.profile.email ?? user.profile.sub) : ''))
       .replace('{{SIGNED_IN}}', user ? '' : 'hidden')
       .replace('{{SIGNED_OUT}}', user ? 'hidden' : '')
@@ -84,7 +112,9 @@
     if (window.location.search.includes('code=')) {
       try {
         const user = await mgr.signinRedirectCallback()
-        window.history.replaceState({}, '', '/')
+        // Back to the bare page, minus `code`/`state` — but **keeping the
+        // toggle**, which is what this page is running as.
+        window.history.replaceState({}, '', iframeRenew ? '/?renew=iframe' : '/')
         show(user)
         return
       } catch (err) {
@@ -100,5 +130,9 @@
     console.log('[node-spa] access token renewed, expires in', user.expires_in, 'seconds')
     show(user)
   })
-  mgr.events.addSilentRenewError((err) => console.error('[node-spa] renew failed', err))
+  // `err.message` rather than `err`: the message is `error_description` as
+  // lanyard wrote it, and a console that prints the object prints "Error" in
+  // one browser family and the whole stack in the other.
+  mgr.events.addSilentRenewError((err) =>
+    console.error('[node-spa] renew failed:', err.message ?? String(err)))
 </script>

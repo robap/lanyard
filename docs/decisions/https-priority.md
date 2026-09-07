@@ -60,6 +60,8 @@ developer running `dotnet run` does not.**
 - **The remaining argument for TLS is silent renew**, which CONCEPT §9 already
   names as the strongest one. That is Phase 9, and this spike deliberately did
   not test `prompt=none`. It is the right place for the question to be reopened.
+  **It was, and it did not hold** — see *Revisited* below and
+  [silent-renew-over-http.md](silent-renew-over-http.md).
 
 ## What this obliges v1 to do instead
 
@@ -82,10 +84,23 @@ Cheap, and they come out of the same evidence:
    Without it, the example fails against lanyard for a reason that has nothing to
    do with anything above.
 
-## Revisit when
+## Revisited — Phase 9 ran it, and the answer is still post-v1
 
-Phase 9 (silent renew, `prompt=none`). A hidden iframe makes lanyard's session
-cookie third-party, which needs `SameSite=None`, which needs `Secure` — and
-unlike the correlation cookie, that one is **lanyard's** cookie on **lanyard's**
-origin, so the localhost exception may not save it. That is the test that could
-move HTTPS forward, and it was explicitly out of scope here.
+This section used to name Phase 9 (silent renew, `prompt=none`) as the one test
+that could move HTTPS forward, on this chain: a hidden iframe makes lanyard's
+session cookie third-party, which needs `SameSite=None`, which needs `Secure`.
+**Phase 9 ran it in Chrome and Firefox and the chain does not close**, for a
+reason nothing here predicted: on the configuration a developer is actually on,
+the iframe is not third-party at all. `SameSite` ignores the port, so an app at
+`http://localhost:5173` and an issuer at `http://localhost:9500` are one site,
+the `Lax` cookie rides the iframe navigation, and the renew completes over plain
+HTTP with no setting anywhere.
+
+When they *are* two sites — the shipped default, whose issuer is
+`http://127.0.0.1:9500` — the renew fails cleanly and `/authorize` says which of
+six things went wrong. That is a naming problem with a one-line rule, not a
+transport problem, and a CA would not fix it.
+
+**The question is closed, not open: [silent-renew-over-http.md](silent-renew-over-http.md).**
+It carries the traces, the counterfactual measurement of what
+`SameSite=None; Secure` would have done, and the verdict in its first line.
