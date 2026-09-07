@@ -259,6 +259,30 @@ differed, or a risk that resolved.
   That window closes as soon as `v0.1.0` publishes the formula, so it was run
   while the rc was the only release.
 
+- **CI caught a flaky test, and it was worth fixing rather than re-running.**
+  `store::tests::a_recently_expired_entry_survives_a_sweep_so_it_can_say_expired`
+  failed on `macos-latest` for commit `987fa0d8` — a commit that changed only a
+  workflow file and this plan, so no Rust at all. The test asserted the store's
+  grace period by sleeping 120ms against a 100ms TTL: the sweep keeps an entry
+  until `expires_at + ttl`, so the sleep had to land inside a window ending at
+  200ms, leaving 80ms of margin. `thread::sleep` only ever overshoots, and a
+  loaded runner overshot; the entry was swept and `take` returned `Unknown`
+  instead of `Expired`.
+  **Fixed by stating the age instead of sleeping for it**, which is the stance
+  `dead_store()`'s doc comment already takes ("testable without sleeping and
+  without a clock injection nobody else needs"). A test-only `expire()` helper
+  backdates `expires_at` by a millisecond against a 60-second TTL, so the sweep
+  must keep the entry for another sixty seconds — no scheduling delay can close
+  that. Nothing in the shipped binary changed; the helper lives in the `#[cfg(test)]`
+  module.
+  Checked that the test was not merely made to pass: with the grace period
+  removed from `sweep` (`expires_at > now`) it still fails, and it now runs in
+  0.00s instead of 120ms. 10/10 clean under saturated CPU, where the old shape
+  is the one CI found. The neighbouring
+  `a_spent_id_is_eventually_forgotten_rather_than_remembered_for_ever` also
+  sleeps, but in the safe direction — it needs the sleep to *exceed* a deadline,
+  and overshooting only helps — so it was left alone.
+
 - **`on: release: [published]` does not fire, and `v0.1.0-rc.1` is how we found
   out.** The rc's Release workflow went green and published the prerelease, and
   `release-image.yml` never started. The cause is a deliberate GitHub rule: the

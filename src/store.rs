@@ -448,6 +448,24 @@ mod tests {
         Expiring::new(Duration::ZERO)
     }
 
+    /// Mark an entry as having expired a moment ago, leaving it inside the
+    /// grace period — the window a zero TTL cannot express, because a zero TTL
+    /// makes the grace period zero too.
+    ///
+    /// The alternative is `thread::sleep`, and it is the reason this exists:
+    /// the sleep has to land *between* `ttl` and `2 * ttl`, and a sleep only
+    /// ever overshoots. On a busy machine it overshoots past the far edge, the
+    /// entry is swept, and the test fails claiming the store forgot something
+    /// it had every right to forget. Stating the age is exact and costs no
+    /// wall time.
+    fn expire<T>(s: &mut Expiring<T>, id: &str) {
+        let entry = s.entries.get_mut(id).expect("no entry under that id");
+        let now = Instant::now();
+        // Saturating: a machine that booted a moment ago has no earlier instant
+        // to name, and "now" already counts as expired (`expires_at <= now`).
+        entry.expires_at = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+    }
+
     #[test]
     fn an_inserted_value_comes_back_under_its_id() {
         let mut s = store();
@@ -542,13 +560,23 @@ mod tests {
 
     /// The grace period, stated as a test: a *recently* expired entry is still
     /// there to be found, so it can report `Expired` rather than `Unknown`.
+    ///
+    /// The 60-second TTL is not patience, it is headroom — the entry expired a
+    /// millisecond ago, so the sweep has to keep it for another sixty seconds,
+    /// and no scheduling delay can close that window. This test used to sleep
+    /// for 120ms against a 100ms TTL, which left 80ms of margin and duly failed
+    /// on a loaded CI runner.
     #[test]
     fn a_recently_expired_entry_survives_a_sweep_so_it_can_say_expired() {
-        let mut s = Expiring::new(Duration::from_millis(100));
+        let mut s = store();
         let id = s.insert("stale");
-        std::thread::sleep(Duration::from_millis(120));
+        expire(&mut s, &id);
         s.insert("fresh");
-        assert_eq!(s.take(&id), Lookup::Expired);
+        assert_eq!(
+            s.take(&id),
+            Lookup::Expired,
+            "the sweep dropped an entry that was still inside its grace period"
+        );
     }
 
     // ------------------------------------------------------------ sessions --
