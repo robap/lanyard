@@ -154,11 +154,11 @@ outcome is real, not when code is written.
 
 **The rcs**
 
-- [ ] 11. **`v0.1.0-rc.1`** — pushed; the release workflow goes green and the
+- [x] 11. **`v0.1.0-rc.1`** — pushed; the release workflow goes green and the
       prerelease page carries the four archives, `lanyard-installer.sh`,
       `dist-manifest.json` and checksums. Cut further rcs freely until it is
       green; they cost nothing and nobody is pointed at them.
-- [ ] 12. **The rc did not touch the tap** — `robap/homebrew-tap` still has no
+- [x] 12. **The rc did not touch the tap** — `robap/homebrew-tap` still has no
       `lanyard.rb` after the rc released, and `brew install robap/tap/lanyard`
       finds nothing. *(Spec criterion 3 — the property that makes rcs safe.)*
 - [ ] 13. **The rc's image is pullable anonymously** — the GHCR package is
@@ -242,6 +242,40 @@ differed, or a risk that resolved.
   (`cargo package` refuses a dirty working tree; the local pre-check used
   `--allow-dirty`, and the CI checkout is clean so the workflow does not pass
   it.)
+- **The rc's release is green and correct.** Run
+  <https://github.com/robap/lanyard/actions/runs/34135730812>: `plan`, four
+  `build-local-artifacts` jobs (including `macos-15-intel` and
+  `ubuntu-24.04-arm`), `build-global-artifacts`, `host` and `announce` all
+  succeeded, and **`publish-homebrew-formula` skipped** — the prerelease
+  property working as designed. The prerelease page carries all four archives
+  with a `.sha256` each, `lanyard-cli-installer.sh`, `dist-manifest.json`,
+  `sha256.sum`, `source.tar.gz` and `lanyard.rb`, and its body is the
+  `CHANGELOG.md` section under an added "## Release Notes" heading.
+- **The tap was checked with `brew` itself, not just the API.**
+  `podman run --rm docker.io/homebrew/brew` → `brew install robap/tap/lanyard`
+  tapped `robap/tap` successfully (so the repository name and visibility are
+  right — Homebrew cloned it) and then failed with
+  `No available formula or cask with the name "robap/tap/lanyard"`, exit 1.
+  That window closes as soon as `v0.1.0` publishes the formula, so it was run
+  while the rc was the only release.
+
+- **`on: release: [published]` does not fire, and `v0.1.0-rc.1` is how we found
+  out.** The rc's Release workflow went green and published the prerelease, and
+  `release-image.yml` never started. The cause is a deliberate GitHub rule: the
+  release is created by dist's `host` job using `secrets.GITHUB_TOKEN`, and
+  GitHub does not start new workflow runs from events caused by that token —
+  it is the guard against a workflow triggering itself forever. So the release
+  event is simply never delivered.
+  **Fixed by triggering on the Release workflow finishing instead**
+  (`on: workflow_run: workflows: [Release]`), which does fire. The job is
+  guarded on `conclusion == 'success'` and `event == 'push'`, the second because
+  the Release workflow also runs on pull requests as a dry run. The tag comes
+  from `workflow_run.head_branch`, falling back to whichever tag points at
+  `head_sha` — and the step then checks that release really exists, so a wrong
+  guess fails loudly instead of building an image from nothing.
+  This is exactly what an rc is for: the failure cost nothing and nobody was
+  pointed at it.
+
 - **A release candidate needs the version bumped in `Cargo.toml` first.** `dist`
   refuses a tag that does not match a package version — pushing `v0.1.0-rc.1`
   with `Cargo.toml` at `0.1.0` fails the release workflow's first job with
@@ -349,7 +383,7 @@ named client. Numbers are the spec's.
       no `lanyard-installer.ps1`.
 - [ ] 2. Every archive's recorded checksum matches `sha256sum` locally; the
       release body is `CHANGELOG.md`'s `0.1.0` section.
-- [ ] 3. `v0.1.0-rc.1` produced a GitHub **prerelease**, and
+- [x] 3. `v0.1.0-rc.1` produced a GitHub **prerelease**, and
       `brew install robap/tap/lanyard` did not offer it at that moment.
 - [ ] 4. `docker.io/library/debian:12`, no cargo: the README's `curl … | sh`
       line installs `lanyard`; `serve` prints the banner; discovery answers with

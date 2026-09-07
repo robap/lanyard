@@ -17,11 +17,21 @@
 # emulated.
 name: Release image
 
+# Runs when the "Release" workflow finishes, not when the release appears.
+#
+# The obvious trigger would be `on: release: [published]`, and it does not work.
+# The release is created by the Release workflow using the token GitHub hands
+# every workflow automatically, and GitHub refuses to start new workflows from
+# anything that token did — it is how they stop a workflow from endlessly
+# triggering itself. So no release event is ever delivered and this file would
+# simply never run. Waiting for the Release workflow to finish gets us the same
+# moment by a route that does fire.
 on:
-  release:
-    types: [published]
-  # Lets you re-run this by hand from the Actions tab if the push to GHCR
-  # failed. Otherwise you would have to create a whole new release to retry.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  # Also runnable by hand from the Actions tab, for retrying a failed push to
+  # GHCR without creating a whole new release.
   workflow_dispatch:
     inputs:
       tag:
@@ -34,6 +44,14 @@ env:
 
 jobs:
   build:
+    # Skip unless there is something worth building an image from: a Release run
+    # that actually succeeded, and that came from a pushed tag rather than from
+    # a pull request (the Release workflow runs on those too, as a dry run).
+    # If this job is skipped the `manifest` job below is skipped with it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -52,14 +70,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Works whether this ran automatically from a release or was started by
-      # hand. `version` is the tag without the leading "v", which is what the
-      # image gets tagged with: v0.1.0 -> 0.1.0.
+      # Works whether this was started by hand or by the Release workflow
+      # finishing. In the second case the tag name usually arrives in
+      # `head_branch`; when it does not, we find it by looking for the tag that
+      # points at the commit that was built. `version` is the tag without the
+      # leading "v", which is what the image gets tagged with: v0.1.0 -> 0.1.0.
       - name: Work out which tag we are building
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          tag='${{ inputs.tag || github.event.release.tag_name }}'
+          tag="${INPUT_TAG:-${RUN_BRANCH:-}}"
+          if [ -z "$tag" ] || ! gh release view "$tag" >/dev/null 2>&1; then
+            tag=$(gh api "repos/$GH_REPO/tags" --paginate \
+                    -q ".[] | select(.commit.sha==\"$RUN_SHA\") | .name" | head -1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::could not work out which tag to build an image for"
+            exit 1
+          fi
+          # There is nothing to build from unless the release actually exists.
+          gh release view "$tag" >/dev/null
+          echo "building from $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
@@ -138,11 +175,33 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Works whether this was started by hand or by the Release workflow
+      # finishing. In the second case the tag name usually arrives in
+      # `head_branch`; when it does not, we find it by looking for the tag that
+      # points at the commit that was built. `version` is the tag without the
+      # leading "v", which is what the image gets tagged with: v0.1.0 -> 0.1.0.
       - name: Work out which tag we are building
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          tag='${{ inputs.tag || github.event.release.tag_name }}'
+          tag="${INPUT_TAG:-${RUN_BRANCH:-}}"
+          if [ -z "$tag" ] || ! gh release view "$tag" >/dev/null 2>&1; then
+            tag=$(gh api "repos/$GH_REPO/tags" --paginate \
+                    -q ".[] | select(.commit.sha==\"$RUN_SHA\") | .name" | head -1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::could not work out which tag to build an image for"
+            exit 1
+          fi
+          # There is nothing to build from unless the release actually exists.
+          gh release view "$tag" >/dev/null
+          echo "building from $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
