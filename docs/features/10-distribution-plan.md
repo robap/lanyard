@@ -103,7 +103,7 @@ outcome is real, not when code is written.
       `ubuntu-latest` and `macos-latest`. Green on a push to a branch; a commit
       with one deliberate formatting error goes red on the `fmt` step, and is
       reverted.
-- [ ] 2. **Packaging is checked without publishing** — a `cargo package
+- [x] 2. **Packaging is checked without publishing** — a `cargo package
       --locked` job whose log lists `web/dist/assets/*` and `web/dist/index.html`
       and no path under `docs/`, `spikes/`, `web/src/` or `.claude/`. Add
       `.github` to `Cargo.toml`'s `exclude` in the same commit.
@@ -132,7 +132,7 @@ outcome is real, not when code is written.
 
 **Operator prerequisites — not automatable**
 
-- [ ] 7. **The tap exists** — `robap/homebrew-tap`, public, empty;
+- [x] 7. **The tap exists** — `robap/homebrew-tap`, public, empty;
       `curl -s -o /dev/null -w '%{http_code}' https://api.github.com/repos/robap/homebrew-tap`
       returns `200` where it returns `404` today.
 - [ ] 8. **The token exists** — a PAT with `repo` scope, added to
@@ -231,15 +231,47 @@ outcome is real, not when code is written.
 Written as the boxes were worked; each one is a place the plan and reality
 differed, or a risk that resolved.
 
-- **Steps 1 and 2 are authored but unobserved.** `.github/workflows/ci.yml`
-  exists with both jobs, and everything the `package` job asserts was run
-  locally first: `cargo package --locked` succeeds (82 files, 603 KB, the
-  verification build compiles), the list contains `web/dist/index.html` and
-  `web/dist/assets/app.*.js`, and nothing under `docs/`, `spikes/`, `scripts/`,
-  `.claude/`, `.github/`, `web/src/` or `web/styles/`. The boxes stay unchecked
-  because their stated outcome is *green on a push*, which needs the operator.
-  (`cargo package` refuses a dirty tree, so the local run used
-  `--allow-dirty`; a CI checkout is clean and the workflow does not pass it.)
+- **CI ran and is green** — run #1, commit `969efeba` on `main`,
+  <https://github.com/robap/lanyard/actions/runs/34125283284>. All three jobs
+  passed: `fmt · clippy · test` on `ubuntu-latest` and on `macos-latest`, and
+  `cargo package`, whose middle step is a set of `grep` assertions that fail the
+  job — so a green tick there means `web/dist/index.html` and
+  `web/dist/assets/*.js` were in the packaged file list and nothing under
+  `docs/`, `spikes/`, `scripts/`, `.claude/`, `.github/`, `web/src/` or
+  `web/styles/` was. That closes step 2 and spec criterion 16.
+  (`cargo package` refuses a dirty working tree; the local pre-check used
+  `--allow-dirty`, and the CI checkout is clean so the workflow does not pass
+  it.)
+- **A release candidate needs the version bumped in `Cargo.toml` first.** `dist`
+  refuses a tag that does not match a package version — pushing `v0.1.0-rc.1`
+  with `Cargo.toml` at `0.1.0` fails the release workflow's first job with
+  "This workspace doesn't have anything for dist to Release!". Verified locally
+  with `dist plan --tag v0.1.0-rc.1`. So `Cargo.toml` (and `Cargo.lock`) say
+  `0.1.0-rc.1` for the rc, and go back to `0.1.0` for the real tag.
+  Two things that do *not* need changing: `CHANGELOG.md` keeps its single
+  `## 0.1.0` section, because `dist` strips the prerelease suffix when it looks
+  the section up (`announcement_changelog` is populated for the rc); and
+  `tests/doctor.rs`'s `contains("lanyard 0.1.0")` still passes, because
+  `lanyard 0.1.0-rc.1` contains that substring. Full suite green at the rc
+  version: 555 passed.
+- **The tap exists, and it needs one commit before the release runs.**
+  `robap/homebrew-tap` is public with `main` as its default branch, and the API
+  answers `200` where it answered `404`. But it is empty in the strict sense —
+  `/commits` returns `409 Git Repository is empty` and it has no branches at
+  all, not even an unborn `main`. The release workflow's Homebrew job starts
+  with `actions/checkout` against that repository, and checkout fetches the
+  default branch by name; with no ref to fetch, that step is expected to fail.
+  **Give the tap an initial commit** — a one-line README is enough — so `main`
+  actually points at something. **Done** — `main` now points at `30d3bff9`, so
+  the release workflow's `actions/checkout` against the tap has a ref to fetch.
+
+- **Step 1 is half observed, and stays unchecked for the other half.** Green on
+  a push to `main` is done. What is missing is the negative case its own wording
+  asks for: a commit with one deliberate formatting error, pushed, going **red**
+  on the `fmt` step and then reverted. A gate that has only ever been seen to
+  pass has not been shown to be a gate. It needs one commit, so it is Rob's to
+  run: put a stray space somewhere in a `.rs` file, push it to a branch, watch
+  `fmt` fail, delete the branch.
 - **`file` says `static-pie linked`, not `statically linked`** (step 3, spec
   criterion 5). That is the static answer for a musl static-PIE binary — the
   dynamic one reads `dynamically linked, interpreter /lib/ld-musl-…`. On this
@@ -352,7 +384,7 @@ named client. Numbers are the spec's.
 - [ ] 15. **(CI)** `ci.yml` green on `ubuntu-latest` and `macos-latest` for a
       push to `main`; a deliberate formatting error goes red on `fmt` and is
       reverted.
-- [ ] 16. **(CI)** `cargo package --locked` succeeds; the file list contains
+- [x] 16. **(CI)** `cargo package --locked` succeeds; the file list contains
       `web/dist/assets/*` and `web/dist/index.html` and no path under `docs/`,
       `spikes/`, `web/src/` or `.claude/`.
 - [ ] 17. A reader following `## Install` reaches a running lanyard by one of
