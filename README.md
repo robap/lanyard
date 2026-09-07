@@ -46,11 +46,28 @@ builder.Services.AddAuthentication(/* … */)
     });
 ```
 
-## Build and run
+## Install
+
+macOS and Linux, arm64 and x86_64. Pick one line:
 
 ```
-cargo build --release
-./target/release/lanyard serve
+brew install robap/tap/lanyard
+```
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/robap/lanyard/releases/latest/download/lanyard-cli-installer.sh | sh
+```
+
+```
+docker run -p 9500:9500 ghcr.io/robap/lanyard
+```
+
+The Linux downloads are statically linked, so they run on distributions older
+than the machine that built them. Then:
+
+```
+lanyard serve
 ```
 
 ```
@@ -72,6 +89,58 @@ curl -s http://127.0.0.1:9500/oidc/.well-known/openid-configuration | jq .
 curl -s http://127.0.0.1:9500/oidc/jwks | jq .
 ```
 
+**`brew services start lanyard` does not work**, and will not until
+`lanyard service install` exists. The formula the tap ships has no service
+stanza, because it is regenerated from the release on every version and a
+hand-added one would survive exactly one of them. `lanyard serve` in the
+foreground is the command; the always-on story is a `launchd` agent, a systemd
+user unit and a Windows scheduled task written by lanyard itself, and it is
+post-v1.
+
+### Windows
+
+**There is no native Windows binary yet**, and there are two ways to run lanyard
+on Windows that are not workarounds. The first is WSL2 — install it inside a WSL
+distribution with the `curl` line above, and run your application on Windows:
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/robap/lanyard/releases/latest/download/lanyard-cli-installer.sh | sh
+```
+
+Your application's discovery, JWKS and code exchange reach
+`127.0.0.1:9500` through WSL2's localhost forwarding, the browser redirect goes
+to the same forwarded port, and the redirect back to your application never
+leaves Windows. The whole browser login works, including the persona picker.
+
+The second needs no WSL at all — Docker Desktop or Podman Desktop, and the same
+image everyone else runs:
+
+```
+docker run -p 9500:9500 ghcr.io/robap/lanyard
+```
+
+Two things to know, and they are the same two on both paths:
+
+- **Use `127.0.0.1`, not `localhost`.** The issuer is
+  `http://127.0.0.1:9500/oidc` and lanyard does not follow the `Host` header, so
+  an application pointed at `localhost:9500` gets tokens that say `127.0.0.1`
+  and `doctor` reports a mismatch that is technically correct and, here, only
+  confusing. Point both sides at `127.0.0.1`.
+- **`LANYARD_BIND=0.0.0.0` is the fallback.** The default loopback bind is
+  usually enough, because WSL2's `localhostForwarding` reaches a listener bound
+  to `127.0.0.1` inside the VM. Mirrored networking mode and some corporate VPN
+  configurations do not, and that is when to bind wider.
+
+### From source
+
+You do not need this to use lanyard; it is here for changing it.
+
+```
+cargo build --release
+./target/release/lanyard serve
+```
+
 **A Rust toolchain is the whole build.** No `node`, no `npm`, no bundler — the
 binary is the whole website. The one page that ships JavaScript, `/_/log`, is a
 [zero](https://github.com/robap/zero) app whose built output lives in `web/dist/`
@@ -87,10 +156,11 @@ zero build            # regenerates web/dist/ — commit it
 There is no CI gate on whether `web/dist/` is current: pinning CI to one `zero`
 version so a byte-identical rebuild could be compared would turn a routine
 framework bump into a red build, and a gate like that gets disabled within a
-month. What is actually load-bearing is checked instead — `cargo publish`'s
-verification build compiles the packaged crate with `web/dist/` embedded and no
-`zero` present. A stale bundle is a cosmetic wrong-version UI; the convention
-carries it. **Regenerate before committing.**
+month. What is actually load-bearing is checked instead — CI's
+`cargo package --locked` job builds the packaged crate with `web/dist/` embedded
+and no `zero` present, and a missing bundle is a `rust-embed` build error rather
+than a smaller binary. A stale bundle is a cosmetic wrong-version UI; the
+convention carries it. **Regenerate before committing.**
 
 The embedded UI costs about 450 KB of binary: 55 KB of JavaScript, 44 KB of CSS,
 and 350 KB of Geist woff2 served from lanyard itself so no page ever asks a CDN
@@ -1236,8 +1306,16 @@ reports the mismatch itself.
 ## Running in a container
 
 ```
+$ podman run --rm -p 9500:9500 ghcr.io/robap/lanyard
+```
+
+`ghcr.io/robap/lanyard` is a multi-arch manifest — `linux/amd64` and
+`linux/arm64`, both built natively — tagged with every released version and
+`latest`. Its binary is the one that release published, not a second compile of
+it. Building the image from a checkout still works and is the same Dockerfile:
+
+```
 $ podman build --format docker -t localhost/lanyard:dev .
-$ podman run --rm -p 9500:9500 localhost/lanyard:dev
 ```
 
 The image is `gcr.io/distroless/static-debian12:nonroot` plus one statically
@@ -1263,7 +1341,7 @@ gotcha at once:
 ```
 $ podman network create lanyard-net
 $ podman run -d --name lanyard --network lanyard-net -p 9500:9500 \
-    -e LANYARD_ISSUER=http://lanyard:9500/oidc localhost/lanyard:dev
+    -e LANYARD_ISSUER=http://lanyard:9500/oidc ghcr.io/robap/lanyard
 $ echo '127.0.0.1 lanyard' | sudo tee -a /etc/hosts
 ```
 
@@ -1321,7 +1399,7 @@ you and every other uid into a subuid range, so a directory you own appears
 inside the container as `root`'s and the non-root process cannot write it:
 
 ```
-$ podman run -v ./lanyard-data:/data localhost/lanyard:dev
+$ podman run -v ./lanyard-data:/data ghcr.io/robap/lanyard
 lanyard: /data is not writable by uid 65532 (this process is in a container).
   A bind-mounted data directory needs its ownership mapped. Try:
       podman run -v ./lanyard-data:/data:U …    # podman, rootless
@@ -1336,7 +1414,7 @@ the file end up owned by *you* at mode `0600`, run as yourself:
 
 ```
 $ podman run --userns=keep-id --user $(id -u):$(id -g) \
-    -v ./lanyard-data:/data localhost/lanyard:dev
+    -v ./lanyard-data:/data ghcr.io/robap/lanyard
 ```
 
 [`scripts/phase08-container.sh`](scripts/phase08-container.sh) drives all of the

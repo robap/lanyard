@@ -1,0 +1,89 @@
+# Runs on every push and pull request: formatting, lints, the test suite, and a
+# check that the packaged crate is complete.
+#
+# The test suite needs no database, no network and no setup — it starts lanyard
+# on a random free port and talks to it — so there is nothing to install here
+# beyond Rust, which the runners already have.
+#
+# Only Linux and macOS, because those are the only platforms we publish binaries
+# for. Testing on a platform nobody can download is just slower CI.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# If you push twice in a row, cancel the first run — its result is about code
+# that no longer exists.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't cancel macOS when Linux fails. If something is broken on one
+      # platform we want to know whether it is broken on the other too.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # We use whatever Rust version the runner came with rather than pinning
+      # one. Printing it means that when a job suddenly goes red, you can see
+      # from the log whether a new compiler is the reason.
+      - run: rustc --version && cargo --version && cargo clippy --version
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --locked
+
+  package:
+    # Builds the crate the way it would be shipped, to catch two mistakes.
+    #
+    # One: the web UI lives in `web/dist/` and gets compiled into the binary. If
+    # it were ever left out of the package, this job fails to build — the
+    # embedding step is a hard error, not a smaller binary.
+    #
+    # Two: docs, spikes and UI source code are meant to be left out, and the
+    # step below checks they really are.
+    #
+    # `cargo package` only builds and inspects. It does not upload anything to
+    # crates.io; we do not publish there. See
+    # docs/decisions/crates-io-reservation.md.
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List what would be packaged
+        run: cargo package --locked --list | tee /tmp/package-list.txt
+
+      # These are checks, not printouts. A file list nobody reads is not a
+      # check, so a wrong list fails the job instead of scrolling past.
+      - name: Check the built UI is included and its source code is not
+        run: |
+          set -euo pipefail
+          list=/tmp/package-list.txt
+          grep -qx 'web/dist/index.html' "$list"
+          grep -qE '^web/dist/assets/.*\.js$' "$list"
+          if grep -E '^(docs|spikes|scripts|\.claude|\.github|web/src|web/styles)/' "$list"; then
+            echo "::error::the lines above should have been excluded from the package"
+            exit 1
+          fi
+
+      # Actually builds the packaged crate. This is the step that fails if the
+      # web UI is missing.
+      - name: Build the packaged crate
+        run: cargo package --locked

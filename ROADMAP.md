@@ -386,13 +386,25 @@ breakage and untestable against most mocks. (CONCEPT §6)
 
 **Goal:** installable by someone who has never heard of Rust. (CONCEPT §7, §14)
 
-- `cargo-dist` in GitHub Actions → release binaries for macOS arm64/x86_64,
-  Linux arm64/x86_64, Windows.
-- Homebrew tap `robap/tap/lanyard` — which gives `brew services start lanyard`
-  for free.
-- Container image on GHCR.
+- `dist` in GitHub Actions → release binaries for macOS arm64/x86_64 and Linux
+  arm64/x86_64. **The Linux pair is statically linked musl**, which is what the
+  older-distro criterion below is actually asking for.
+- **No native Windows binary.** The crate does not compile on Windows —
+  `std::os::unix` at five sites, and a data directory decision — and Windows is
+  reached twice over without it: lanyard in WSL2 with the application on
+  Windows (a full browser login, watched on a real machine), or the container
+  image. The port is five `cfg` gates and a target-list entry whenever anyone
+  asks; see `docs/features/10-distribution-spec.md`.
+- Homebrew tap `robap/tap/lanyard`. **It does not give `brew services start
+  lanyard`** — the generated formula has no service stanza and is regenerated
+  every release, so the always-on story stays CONCEPT §7's post-v1
+  `lanyard service install`: a launchd agent, a systemd user unit and a Windows
+  scheduled task, for everyone who installed by any channel.
+- Container image on GHCR, a multi-arch manifest built from the release's own
+  binaries.
 - curl installer for the README one-liner.
-- Crate `lanyard-cli`, binary `lanyard`.
+- Crate `lanyard-cli`, binary `lanyard`. Not published to crates.io — see
+  `docs/decisions/crates-io-reservation.md`.
 
 **Acceptance**
 

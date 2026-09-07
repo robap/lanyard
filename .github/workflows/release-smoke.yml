@@ -1,0 +1,183 @@
+# Checks a finished release on hardware we do not own.
+#
+# You start this by hand: Actions -> Release smoke -> Run workflow, and type the
+# tag (for example v0.1.0). Run it after a release has finished publishing.
+#
+# Most of a release can be checked on a Linux desktop. Three things cannot:
+# whether the ARM binary works, whether `brew install` works on a Mac, and
+# whether the ARM half of the container image works. This runs those three
+# checks on GitHub's Mac and ARM runners and leaves the answer in a log.
+#
+# It builds nothing. Each job downloads what the release published and uses it
+# the way a person would, then checks the result.
+#
+# Keep this file around — it is how the next release gets checked too.
+name: Release smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to smoke-test (e.g. v0.1.0)
+        required: true
+        type: string
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # Does the ARM Linux download actually work on an ARM machine?
+  linux-arm64:
+    name: The ARM binary, on ARM
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      # As in release-image.yml, the filename comes from the release's own
+      # `dist-manifest.json` rather than being hardcoded here.
+      - name: Download the ARM binary this release published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release download '${{ inputs.tag }}' --pattern dist-manifest.json --dir .
+          archive=$(jq -r '
+            .artifacts | to_entries
+            | map(select(.value.kind == "executable-zip"
+                         and (.value.target_triples // [] | index("aarch64-unknown-linux-musl"))))
+            | .[0].key // empty' dist-manifest.json)
+          test -n "$archive" || { echo "::error::no aarch64 archive in the manifest"; exit 1; }
+          gh release download '${{ inputs.tag }}' --pattern "$archive" --dir .
+          mkdir -p bin
+          tar -xf "$archive" --strip-components=1 -C bin --wildcards '*/lanyard'
+          chmod +x bin/lanyard
+
+      # Two things worth being sure of before trusting the download:
+      # it really is an ARM build (not an Intel one with the wrong name), and
+      # it really is self-contained, with no system libraries required. The
+      # second is what lets it run on old Linux distributions.
+      - name: Check it is an ARM build with nothing else needed to run it
+        run: |
+          set -euo pipefail
+          out=$(file bin/lanyard); echo "$out"
+          echo "$out" | grep -q 'ARM aarch64'
+          echo "$out" | grep -qE 'statically linked|static-pie linked'
+          ldd bin/lanyard 2>&1 | grep -q 'not a dynamic executable\|statically linked'
+
+      - name: Start it and get a token out of it
+        run: |
+          set -euo pipefail
+          ./bin/lanyard serve > serve.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:9500/_/health >/dev/null && break
+            sleep 1
+          done
+          cat serve.log
+          curl -sf http://127.0.0.1:9500/oidc/.well-known/openid-configuration | jq -e .issuer
+          token=$(./bin/lanyard token --as ada --aud billing-api)
+          # Decode the middle section of the token and check it says what was
+          # asked for. This is not a signature check — the macOS job does that
+          # properly with a real JWT library.
+          python3 - "$token" <<'PY'
+          import base64, json, sys
+          claims = sys.argv[1].split('.')[1]
+          claims += '=' * (-len(claims) % 4)
+          payload = json.loads(base64.urlsafe_b64decode(claims))
+          print(json.dumps(payload, indent=1))
+          assert payload['aud'] == 'billing-api', payload
+          assert payload['iss'] == 'http://127.0.0.1:9500/oidc', payload
+          PY
+
+  # Does `brew install` work on a Mac that has never seen this project?
+  macos-brew:
+    name: brew install, on macOS
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: brew install robap/tap/lanyard
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          brew install robap/tap/lanyard 2>&1 | tee brew.log
+          # Confirm Homebrew downloaded a finished binary instead of building
+          # one from source. Installing without needing a Rust toolchain is the
+          # entire point of shipping a Homebrew package, so if the log does not
+          # show that download, something is wrong even though it "worked".
+          grep -qE 'Downloading https://github.com/robap/lanyard/releases/download/' brew.log
+          # The version it reports should be the tag we asked for. If those
+          # ever drift apart, a bug report saying "I'm on 0.1.0" stops meaning
+          # anything.
+          lanyard --version
+          test "$(lanyard --version)" = "lanyard ${TAG#v}"
+
+      # The README tells people that `brew services start lanyard` does not
+      # work, because the Homebrew package we generate has no service
+      # definition in it. This prints which of those is true today, so if that
+      # ever changes we find out here rather than from a confused user.
+      - name: Does Homebrew think it can run this as a background service?
+        run: |
+          set -euo pipefail
+          formula=$(brew formula robap/tap/lanyard)
+          if grep -qE '^\s*service do' "$formula"; then
+            echo "SERVICE STANZA PRESENT — brew services start lanyard should work"
+          else
+            echo "NO SERVICE STANZA — brew services will refuse; the README names lanyard serve"
+          fi
+
+      # The last check is the important one: a token is handed to `jose`, a
+      # widely used JavaScript JWT library, which fetches lanyard's public key
+      # over HTTP and verifies the signature. That is what a real application
+      # would do, so it is stronger evidence than lanyard agreeing with itself.
+      - name: Start it and have a real JWT library verify a token
+        run: |
+          set -euo pipefail
+          lanyard serve > serve.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:9500/_/health >/dev/null && break
+            sleep 1
+          done
+          cat serve.log
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:9500/oidc/.well-known/openid-configuration)
+          test "$code" = 200
+          token=$(lanyard token --as ada --aud billing-api)
+          npm --prefix scripts install --silent
+          node scripts/jose-verify.mjs "$token" http://127.0.0.1:9500/oidc billing-api
+
+  # The image tag points at an Intel build and an ARM build. The Intel one gets
+  # checked on a desktop; this checks the ARM one on an ARM machine.
+  image-arm64:
+    name: The container image, on ARM
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # Pulling on an ARM machine should get the ARM image. If the tag were
+      # wired up wrong, this is where it shows: the architecture check fails
+      # rather than something crashing mysteriously later.
+      - name: Pull the image and check what arrived
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          docker pull "$IMAGE:$version"
+          arch=$(docker image inspect "$IMAGE:$version" --format '{{.Architecture}}')
+          echo "architecture: $arch"
+          test "$arch" = arm64
+          docker run -d --name lanyard -p 9500:9500 "$IMAGE:$version"
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:9500/_/health >/dev/null && break
+            sleep 1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:9500/oidc/.well-known/openid-configuration)
+          echo "discovery: $code"
+          test "$code" = 200
+          docker logs lanyard

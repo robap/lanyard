@@ -1,0 +1,55 @@
+[workspace]
+members = ["cargo:."]
+
+# **A tag is the entire release interface.** `git push origin v0.1.0` produces
+# the archives, the checksums, the release page, the shell installer and the
+# Homebrew formula; nothing here is uploaded by hand. `release.yml` is generated
+# from this file by `dist generate` and is never hand-edited — an edit survives
+# exactly until the next config change.
+[dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+hosting = "github"
+
+# **Four targets, and the Linux pair is musl on purpose.** A default
+# `x86_64-unknown-linux-gnu` build links against the build host's glibc and
+# dies with `GLIBC_2.xx not found` on anything older — a failure that is
+# invisible until it happens on somebody else's laptop. Static is north star 5,
+# and it is the only way "runs on a distro older than the build host" is true.
+#
+# No `x86_64-pc-windows-msvc`: the crate does not compile on Windows yet
+# (`std::os::unix` at five sites). Windows is reached through WSL2 and the
+# container image — see the README's `## Install`. Adding the target later is
+# additive.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+
+# The curl one-liner in the README, and the tap. No PowerShell installer, for
+# the same reason there is no Windows target.
+installers = ["shell", "homebrew"]
+
+# **Not `$CARGO_HOME/bin`.** The audience for a local OIDC provider is not Rust
+# developers — the whole point of this phase is that nobody has to install a
+# toolchain — so the binary goes where a machine without one already looks.
+install-path = "~/.local/bin"
+
+# Homebrew's convention: the repository is `homebrew-tap`, the install line is
+# `brew install robap/tap/lanyard`. Pushing to a second repository needs the
+# `HOMEBREW_TAP_TOKEN` secret; `GITHUB_TOKEN` cannot reach it.
+tap = "robap/homebrew-tap"
+publish-jobs = ["homebrew"]
+
+# **This is the property that makes release candidates safe.** `v0.1.0-rc.1`
+# exercises the whole pipeline — runners, musl targets, checksums, the GHCR
+# workflow — while `brew install robap/tap/lanyard` still finds nothing.
+publish-prereleases = false
+
+# **Both Linux architectures build natively.** `ubuntu-24.04-arm` is free for
+# public repositories, so the arm64 binary is produced by an arm64 machine
+# rather than cross-compiled and hoped about.
+[dist.github-custom-runners]
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"

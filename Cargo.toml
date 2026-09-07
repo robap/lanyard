@@ -5,9 +5,14 @@ edition = "2021"
 description = "A local OIDC provider with nothing to configure"
 license = "MIT"
 repository = "https://github.com/robap/lanyard"
+# The Homebrew formula carries a homepage; without one `dist` warns and the tap
+# ships a formula with a blank field.
+homepage = "https://github.com/robap/lanyard"
 # **`web/dist/` ships; nothing else under `web/` does.** The built UI is what
 # `rust-embed` compiles in, so a `cargo install` with no `zero` on PATH needs
-# it — and `cargo publish`'s verification build is the check that it is there.
+# it — and CI's `cargo package --locked` job is the check that it is there:
+# it builds the packaged crate, where a missing bundle is a `rust-embed` error
+# rather than a smaller binary. Nothing here publishes to crates.io.
 # The zero *sources*, the spikes and the docs are how the repository works, not
 # how the crate builds, and they are three quarters of the package by file
 # count. `exclude` rather than `include` so a new source file is shipped by
@@ -24,6 +29,9 @@ exclude = [
     "/web/AGENTS.md",
     "/web/.gitignore",
     "/.claude",
+    # How the repository is built and released, not how the crate is. CI's own
+    # `cargo package` job asserts it stays out.
+    "/.github",
 ]
 
 [lib]
@@ -81,3 +89,18 @@ sha2 = { version = "0.10", features = ["oid"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "cookies", "stream"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+# **The profile the downloaded binary is built with.** Thin LTO and no symbols:
+# an artifact somebody waits on a network for should be the small one.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+strip = "symbols"
+
+# **`brew install robap/tap/lanyard`, not `lanyard-cli`.** The crate keeps the
+# name reserved for it on crates.io; the thing a person installs is called what
+# the binary is called. `dist` names the formula after the package otherwise,
+# and the tap is regenerated on every release, so this is the only place it can
+# be said.
+[package.metadata.dist]
+formula = "lanyard"

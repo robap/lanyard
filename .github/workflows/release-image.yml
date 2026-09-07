@@ -1,0 +1,190 @@
+# Publishes the container image to GHCR after a release is created.
+#
+# It does not compile anything. The release that just finished already built a
+# Linux binary for each CPU architecture, so this downloads those and copies
+# them into the image. Compiling again here would risk the image and the
+# download being subtly different builds.
+#
+# There are two jobs:
+#
+#   build     runs twice, once on an Intel runner and once on an ARM runner,
+#             each producing an image for its own architecture
+#   manifest  ties the two together under one tag, so `docker pull` gets the
+#             right one automatically
+#
+# The ARM image is built on a real ARM machine (GitHub gives public repos free
+# ARM runners), so it is actually run on the hardware it targets rather than
+# emulated.
+name: Release image
+
+on:
+  release:
+    types: [published]
+  # Lets you re-run this by hand from the Actions tab if the push to GHCR
+  # failed. Otherwise you would have to create a whole new release to retry.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to build the image from (e.g. v0.1.0)
+        required: true
+        type: string
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      # Works whether this ran automatically from a release or was started by
+      # hand. `version` is the tag without the leading "v", which is what the
+      # image gets tagged with: v0.1.0 -> 0.1.0.
+      - name: Work out which tag we are building
+        id: tag
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.event.release.tag_name }}'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # Every release includes a `dist-manifest.json` listing what it published
+      # and for which platform. We look the filename up there rather than
+      # hardcoding it, so that if the release tool ever renames its archives
+      # this fails loudly instead of quietly building no image.
+      - name: Download the binary this release published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          gh release download "$TAG" --pattern dist-manifest.json --dir .
+          archive=$(jq -r --arg t '${{ matrix.target }}' '
+            .artifacts | to_entries
+            | map(select(.value.kind == "executable-zip"
+                         and (.value.target_triples // [] | index($t))))
+            | .[0].key // empty' dist-manifest.json)
+          test -n "$archive" || {
+            echo "::error::dist-manifest.json has no executable-zip for ${{ matrix.target }}"
+            exit 1
+          }
+          echo "archive: $archive"
+          gh release download "$TAG" --pattern "$archive" --dir .
+          tar -xf "$archive" --strip-components=1 -C ctx --wildcards '*/lanyard'
+          chmod +x ctx/lanyard
+          ./ctx/lanyard --version
+
+      - name: Log in to GHCR
+        run: |
+          echo '${{ github.token }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      # Two flags here are not arbitrary:
+      #
+      # `--driver docker-container` — the builder Docker uses by default cannot
+      # upload an image without giving it a tag. We do not want a tag yet: this
+      # is only half of the final image, and the `manifest` job below is what
+      # names it. So we upload it unnamed and remember its ID (its "digest").
+      #
+      # `oci-mediatypes=false` — writes the image in Docker's older format,
+      # which supports HEALTHCHECK. Our image has no shell in it, so the health
+      # check is the only way anything can tell whether the container is up. In
+      # the newer format that instruction would be silently dropped.
+      - name: Build the image and upload it
+        id: push
+        run: |
+          set -euo pipefail
+          docker buildx create --driver docker-container --use --name lanyard-builder
+          docker buildx build ctx \
+            --file Dockerfile \
+            --build-arg BINARY_STAGE=prebuilt \
+            --platform '${{ matrix.platform }}' \
+            --metadata-file metadata.json \
+            --output "type=image,name=$IMAGE,oci-mediatypes=false,push-by-digest=true,name-canonical=true,push=true"
+          digest=$(jq -r '."containerimage.digest"' metadata.json)
+          test -n "$digest" && test "$digest" != null
+          echo "$digest" > "digest-$(echo '${{ matrix.platform }}' | tr / -)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digest-*
+          retention-days: 1
+
+  # Both images are now uploaded but unnamed. This job creates the tag that
+  # points at both of them at once, so `docker pull ghcr.io/robap/lanyard:0.1.0`
+  # gets the Intel image on an Intel machine and the ARM image on a Mac.
+  manifest:
+    name: One tag, two architectures
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Work out which tag we are building
+        id: tag
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.event.release.tag_name }}'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # A prerelease (v0.1.0-rc.1) is for testing the pipeline, not for users.
+      # It still gets its own version tag so we can pull and check it, but it
+      # must never become `:latest`, because that is what people get when they
+      # type `docker run ghcr.io/robap/lanyard` with no tag.
+      - name: Is this a prerelease?
+        id: kind
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pre=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)
+          echo "prerelease=$pre" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Log in to GHCR
+        run: |
+          echo '${{ github.token }}' \
+            | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      # `imagetools create` is what makes one tag point at several images.
+      # The check that there are exactly two guards against a half-finished
+      # release where one architecture failed to build.
+      - name: Point one tag at both images
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+          PRERELEASE: ${{ steps.kind.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tags=(-t "$IMAGE:$VERSION")
+          if [ "$PRERELEASE" = false ]; then tags+=(-t "$IMAGE:latest"); fi
+          refs=()
+          for f in digests/digest-*; do refs+=("$IMAGE@$(cat "$f")"); done
+          test "${#refs[@]}" -eq 2 || { echo "::error::expected 2 digests, got ${#refs[@]}"; exit 1; }
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
