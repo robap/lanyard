@@ -60,10 +60,20 @@ jobs:
       - name: Check it is an ARM build with nothing else needed to run it
         run: |
           set -euo pipefail
-          out=$(file bin/lanyard); echo "$out"
+          out=$(file bin/lanyard)
+          echo "file: $out"
           echo "$out" | grep -q 'ARM aarch64'
           echo "$out" | grep -qE 'statically linked|static-pie linked'
-          ldd bin/lanyard 2>&1 | grep -q 'not a dynamic executable\|statically linked'
+
+          # **`ldd` exits 1 when a binary needs no dynamic linker**, which is
+          # the answer we are hoping for. Its status is therefore discarded and
+          # only its output judged — otherwise this check fails exactly when the
+          # binary is as static as we wanted. Both spellings are accepted: a
+          # plain static binary reports "not a dynamic executable" and a
+          # static-PIE one reports "statically linked".
+          linkage=$(ldd bin/lanyard 2>&1 || true)
+          echo "ldd: $linkage"
+          echo "$linkage" | grep -qE 'not a dynamic executable|statically linked'
 
       - name: Start it and get a token out of it
         run: |

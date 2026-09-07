@@ -294,6 +294,31 @@ differed, or a risk that resolved.
   `macos-latest`, and it failed the run — so the job wiring itself is proven;
   it is only the `fmt` step specifically that has only ever been green.
 
+- **`ldd` exits 1 on a static binary, and `pipefail` turned that into a failed
+  job.** The first `release-smoke.yml` dispatch failed on
+  `ldd bin/lanyard 2>&1 | grep -q …` — the `grep` matched, but `ldd` had already
+  exited `1`, and `set -o pipefail` propagates that. **The check failed
+  precisely because the binary was as static as it was supposed to be.**
+  The two Linux targets differ here, which is why this only bit the ARM job:
+  the x86_64 static-PIE binary prints `statically linked` and exits `0`; the
+  aarch64 plain-static one prints `not a dynamic executable` and exits `1`.
+  Reproduced locally against both released archives before changing anything.
+  **Fixed** by capturing `ldd`'s output with `|| true` and judging only the
+  text, and by echoing the `file` and `ldd` lines instead of hiding them behind
+  `grep -q` — the original failure log showed the `file` output and nothing at
+  all about `ldd`, which is why it took a local reproduction to place.
+- **Audited the other two workflows for the same trap rather than waiting for
+  it.** Every pipeline under `set -o pipefail` in `ci.yml`, `release-image.yml`
+  and `release-smoke.yml` was checked for a command whose non-zero exit is
+  normal. One more found, latent: `release-image.yml`'s tag fallback ran
+  `gh api --paginate … | head -1`, where `head` closes the pipe after one line
+  and `gh` dies of SIGPIPE. It has never executed — `workflow_run.head_branch`
+  carried the tag for `v0.1.0`, so the fallback was never reached — and it
+  would have failed the first time it was. Rewritten to take the first line with
+  `${matches%%$'\n'*}`, no second process. Everything else is safe: `echo | grep`
+  cannot fail on the left, `grep` inside an `if` is exempt from `set -e`, and
+  `curl -sf | jq -e` is meant to fail when the request fails.
+
 - **`v0.1.0` is out, and everything the rc rehearsed held.** Release run
   <https://github.com/robap/lanyard/actions/runs/34139793679> — all nine jobs
   green, **including `publish-homebrew-formula`**, which had never run before

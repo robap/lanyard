@@ -87,8 +87,14 @@ jobs:
           set -euo pipefail
           tag="${INPUT_TAG:-${RUN_BRANCH:-}}"
           if [ -z "$tag" ] || ! gh release view "$tag" >/dev/null 2>&1; then
-            tag=$(gh api "repos/$GH_REPO/tags" --paginate \
-                    -q ".[] | select(.commit.sha==\"$RUN_SHA\") | .name" | head -1)
+            # Deliberately no `| head -1`: `head` closes the pipe after the
+            # first line, `gh` is killed by SIGPIPE, and `pipefail` would then
+            # fail this step over an answer we had already got. Take the first
+            # line with a parameter expansion instead — no second process, no
+            # exit status to trip over.
+            matches=$(gh api "repos/$GH_REPO/tags" --paginate \
+                        -q ".[] | select(.commit.sha==\"$RUN_SHA\") | .name")
+            tag="${matches%%$'\n'*}"
           fi
           if [ -z "$tag" ]; then
             echo "::error::could not work out which tag to build an image for"
