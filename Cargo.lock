@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "lanyard-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",

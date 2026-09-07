@@ -1,6 +1,6 @@
 [package]
 name = "lanyard-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0"
 edition = "2021"
 description = "A local OIDC provider with nothing to configure"
 license = "MIT"

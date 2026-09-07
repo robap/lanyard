@@ -98,11 +98,11 @@ outcome is real, not when code is written.
 
 **Before anything is published**
 
-- [ ] 1. **CI exists** — `.github/workflows/ci.yml` runs `cargo fmt --check`,
+- [x] 1. **CI exists** — `.github/workflows/ci.yml` runs `cargo fmt --check`,
       `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` on
-      `ubuntu-latest` and `macos-latest`. Green on a push to a branch; a commit
-      with one deliberate formatting error goes red on the `fmt` step, and is
-      reverted.
+      `ubuntu-latest` and `macos-latest`, green on pushes to `main`. *(The
+      deliberate-formatting-error half was dropped by decision — see Progress
+      notes.)*
 - [x] 2. **Packaging is checked without publishing** — a `cargo package
       --locked` job whose log lists `web/dist/assets/*` and `web/dist/index.html`
       and no path under `docs/`, `spikes/`, `web/src/` or `.claude/`. Add
@@ -146,7 +146,7 @@ outcome is real, not when code is written.
       the context. `podman build --format docker -t localhost/lanyard:dev .`
       with no arguments still produces exactly what Phase 8's criteria 15–17
       assert: under 20 MB, no shell, same `kid`, `:U` volume behaviour intact.
-- [ ] 10. **GHCR workflow** — `release-image.yml` on `release: published` and
+- [x] 10. **GHCR workflow** — `release-image.yml` on `release: published` and
       on `workflow_dispatch(tag)`: builds on `ubuntu-latest` and
       `ubuntu-24.04-arm` **natively**, each from that release's own musl
       archive, pushes by digest, then assembles one manifest list tagged with
@@ -161,7 +161,7 @@ outcome is real, not when code is written.
 - [x] 12. **The rc did not touch the tap** — `robap/homebrew-tap` still has no
       `lanyard.rb` after the rc released, and `brew install robap/tap/lanyard`
       finds nothing. *(Spec criterion 3 — the property that makes rcs safe.)*
-- [ ] 13. **The rc's image is pullable anonymously** — the GHCR package is
+- [x] 13. **The rc's image is pullable anonymously** — the GHCR package is
       switched to public in its settings; `podman pull` of the rc tag from a
       shell with no registry login succeeds.
 
@@ -282,6 +282,41 @@ differed, or a risk that resolved.
   `a_spent_id_is_eventually_forgotten_rather_than_remembered_for_ever` also
   sleeps, but in the safe direction — it needs the sleep to *exceed* a deadline,
   and overshooting only helps — so it was left alone.
+
+- **The deliberate formatting error was dropped, deliberately.** Step 1 and spec
+  criterion 15 both asked for a commit that goes red on `fmt`, to show the gate
+  can fail and not merely pass. Rob's call on 2026-09-07: not worth a push
+  cycle. Both boxes are checked on the positive half only, and the wording now
+  says so rather than implying the negative case was observed.
+  What that leaves untested: that `cargo fmt --all -- --check` fails the job
+  rather than, say, being swallowed by a shell quirk. `clippy` and `test` have
+  each been seen to fail for real — `clippy` never, but `test` did, on
+  `macos-latest`, and it failed the run — so the job wiring itself is proven;
+  it is only the `fmt` step specifically that has only ever been green.
+
+- **The rc's image is real, and every property it was built to have holds.**
+  Run <https://github.com/robap/lanyard/actions/runs/34139259951>: both
+  architecture jobs and the manifest job green. Checked from this machine with
+  no registry login:
+  - `ghcr.io/v2/robap/lanyard/tags/list` anonymously → `200`, and the only tag
+    is `0.1.0-rc.1`. **No `latest`** — the prerelease guard in the manifest job
+    working. The package was public without anyone changing a setting, so the
+    "first push creates a private package" risk did not materialise.
+  - The manifest list is
+    `application/vnd.docker.distribution.manifest.list.v2+json` with exactly two
+    entries, `linux/amd64` and `linux/arm64`, and **no `unknown/unknown`**
+    entries — the attestation fix confirmed from the outside.
+  - `podman pull` anonymously → 8.34 MB. `podman image inspect` shows the
+    `HEALTHCHECK` present as `["CMD","/lanyard","doctor","--quiet"]`, which is
+    the thing `oci-mediatypes=false` exists to protect and was until now assumed
+    rather than observed.
+  - Run with `-p 9500:9500`: `healthy` in about 4 seconds, discovery `200`,
+    issuer `http://127.0.0.1:9500/oidc`, `/_/health` reports `0.1.0-rc.1`, and
+    `--entrypoint /bin/sh` still fails. The `kid` is
+    `TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU`, the same one the native
+    binary and Phase 8's local image serve.
+  This is spec criterion 12's whole checklist passing against an rc; criterion
+  12 itself stays open because it names `v0.1.0`.
 
 - **`oci-mediatypes=false` and BuildKit's default attestations are mutually
   exclusive.** The dispatched image run failed on *both* architectures at the
@@ -453,9 +488,9 @@ named client. Numbers are the spec's.
       and gets `200` on discovery.
 - [ ] 14. `:latest` and `:0.1.0` are the same digest, and the `kid` served
       matches the native binary's and Phase 8's local image's.
-- [ ] 15. **(CI)** `ci.yml` green on `ubuntu-latest` and `macos-latest` for a
-      push to `main`; a deliberate formatting error goes red on `fmt` and is
-      reverted.
+- [x] 15. **(CI)** `ci.yml` green on `ubuntu-latest` and `macos-latest` for a
+      push to `main`. *(The deliberate-formatting-error half was dropped by
+      decision — see Progress notes.)*
 - [x] 16. **(CI)** `cargo package --locked` succeeds; the file list contains
       `web/dist/assets/*` and `web/dist/index.html` and no path under `docs/`,
       `spikes/`, `web/src/` or `.claude/`.

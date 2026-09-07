@@ -458,9 +458,10 @@ output or it goes red, and the log is the artifact.
 
 - [ ] 15. **(CI)** `ci.yml` runs `cargo fmt --check`,
       `cargo clippy --all-targets -- -D warnings` and `cargo test --locked`
-      green on `ubuntu-latest` and `macos-latest` for a push to `main`; a
-      branch with one deliberate formatting error goes red on the `fmt` step
-      and is reverted.
+      green on `ubuntu-latest` and `macos-latest` for a push to `main`.
+      ~~a branch with one deliberate formatting error goes red on the `fmt`
+      step and is reverted~~ — **dropped by decision, 2026-09-07**: not worth a
+      push cycle. See the plan's Progress notes for what that leaves untested.
 - [ ] 16. **(CI)** `cargo package --locked` succeeds, and the resulting file
       list contains `web/dist/assets/*.js` and `web/dist/index.html` and
       contains no path under `docs/`, `spikes/`, `web/src/` or `.claude/` —
