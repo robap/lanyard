@@ -153,14 +153,33 @@ options.TokenValidationParameters.ClockSkew = TimeSpan.Zero;
 
 Measured both ways in [`docs/decisions/dotnet-jwt-bearer-settings.md`](docs/decisions/dotnet-jwt-bearer-settings.md).
 
-**Scope.** This is Phase 7. There is a discovery document, a JWKS, all three
+**lanyard allows itself five seconds, and only five.** Every token is minted with
+`nbf` five seconds before `iat` — `iat` and `exp` are untouched, because
+extending `exp` would silently lengthen a TTL that is 60 seconds on purpose — and
+lanyard's own `/oidc/userinfo`, `/oidc/introspect` and `/oidc/revoke` accept a
+token up to five seconds past `exp`. That is enough for a relying party whose
+clock is a second or two behind, and nowhere near enough to make the
+90-seconds-later rejection stop happening. It is also the opposite end of the
+scale from .NET's default five *minutes*.
+
+A refusal says which clock it doubts, rather than returning a bare `401`:
+
+| State of the token | The `401` says |
+|---|---|
+| `exp` more than 5s past | `the token expired 4m12s ago` |
+| `nbf` more than 5s ahead | `the token is not valid yet — the clock that issued it is ahead of this one by about 5m0s. Check the clocks on both sides; run lanyard doctor` |
+| either, on a process running skewed | …`(this process's clock is skewed by -5m0s via LANYARD_CLOCK_SKEW)` |
+
+**Scope.** This is Phase 8. There is a discovery document, a JWKS, all three
 arms of `/oidc/token` — `client_credentials`, `authorization_code` and
 `refresh_token` — plus `/oidc/authorize`, `/oidc/userinfo`,
 `/oidc/end_session`, `/oidc/introspect`, `/oidc/revoke`, the persona picker at
 `/_/` with its three session controls, browser sessions, the live request log at
 `/_/log` and `lanyard logs`, project personas via `lanyard link` and `client:`
 namespacing, the `token` and `env` CLI commands, the six deliberate failure
-flags, and the test seam. There is no back-channel or front-channel logout, no
+flags, the test seam, `lanyard doctor` and `GET /_/health`, a `Host`-mismatch
+warning, and a distroless container image. There is no back-channel or
+front-channel logout, no
 `sid` in the ID token, no `check_session_iframe`, nothing persisted across a
 restart *except the list of linked project directories*, and no consent screen —
 a consent screen is client registration in a different costume.
@@ -177,7 +196,34 @@ Every setting is an environment variable read once at startup. All are optional.
 | `LANYARD_DATA_DIR` | `$XDG_DATA_HOME/lanyard` | Signing key lives here |
 | `LANYARD_PERSONAS` | `$XDG_CONFIG_HOME/lanyard/users.yaml` | Global persona file; when set, it must exist |
 | `LANYARD_LINKS` | `$XDG_CONFIG_HOME/lanyard/links.yaml` | Linked persona files; absent means none, set or not |
-| `LANYARD_URL` | `http://127.0.0.1:{port}` | Where `lanyard token` and `lanyard env` reach the server |
+| `LANYARD_URL` | `http://127.0.0.1:{port}` | Where `lanyard token`, `lanyard logs` and `lanyard doctor` reach the server |
+| `LANYARD_CLOCK_SKEW` | unset | Move this process's clock: `-5m`, `+90s`, `300`. Deliberately wrong, and loud about it |
+
+`LANYARD_CLOCK_SKEW` is the seventh deliberate failure mode, and the only one
+that is not a flag on `lanyard token`. It offsets **every** clock read in the
+process — the tokens it mints, the timestamps in its log, the `now` it reports on
+`/_/health` — so a skewed lanyard is internally consistent and wrong about the
+world, which is what a drifted VM actually looks like. It exists because on
+native Linux there is no way to skew a container's clock: `CLOCK_REALTIME` is not
+virtualized by time namespaces, so a rootless container's clock *is* the host's.
+
+It is loud on purpose. The banner gains a line, `/_/health` reports it, every
+expiry rejection names it, and `lanyard doctor` reports it as a `WARN` even when
+the two clocks agree by construction. A dev tool may lie about the time; it may
+not do so quietly.
+
+```
+$ LANYARD_CLOCK_SKEW=-5m lanyard serve
+lanyard 0.1.0
+  Issuer    → http://127.0.0.1:9500/oidc
+  …
+  Clock     → skewed -5m0s (LANYARD_CLOCK_SKEW) — tokens minted here are already expired by 4m0s for anything
+              on a correct clock
+```
+
+`doctor` reads the true clock even when `LANYARD_CLOCK_SKEW` is set in its own
+environment, and says so — otherwise a developer with it exported would run a
+skewed `serve`, a skewed `doctor`, and be told the clocks agree.
 
 `LANYARD_URL` is an address; `LANYARD_ISSUER` is a string that goes in a token.
 They are deliberately separate knobs. Set the issuer to `http://lanyard:9500/oidc`
@@ -1039,6 +1085,210 @@ curl -s http://127.0.0.1:9500/_/api/personas | jq .warnings
 An unknown persona, a body that is not a JSON object, or a non-numeric `ttl`
 returns `400` with `{"error", "error_description"}`.
 
+## `lanyard doctor`
+
+Six checks, one line each, in the order a request travels. Anything that is not
+`OK` is followed by an indented **consequence sentence** and, where there is one,
+the command that fixes it — a check that says "port mismatch" and stops has moved
+you one step; a check that says what will be rejected has finished the job.
+
+```
+$ lanyard doctor
+lanyard doctor
+  Config       OK    issuer http://127.0.0.1:9500/oidc, bind 127.0.0.1:9500
+  Reachable    OK    http://127.0.0.1:9500 answered in 0ms (lanyard 0.1.0)
+  Issuer       OK    the running server agrees with the address I dialled
+  JWKS         OK    http://127.0.0.1:9500/oidc/jwks, 1 key, kid TXntCt2b…
+  Clock        OK    0.000s apart
+  Signing key  OK    /home/you/.local/share/lanyard/signing-key.pem, 0600, the built-in default key — stable across a wiped data dir
+```
+
+| Check | What it does |
+|---|---|
+| **Config** | Resolves the environment exactly as `serve` does. `FAIL` on anything `serve` would refuse to start with |
+| **Reachable** | `GET /_/health` at `LANYARD_URL`. `FAIL` — nothing is listening, and everything below it is skipped rather than guessed at |
+| **Issuer** | Compares the discovery document's `issuer` against the authority `doctor` dialled, and reports every other name the server has been reached by |
+| **JWKS** | Fetches `jwks_uri` **as advertised**, not as configured, and compares its `kid` to the live one |
+| **Clock** | `/_/health`'s `now` against `doctor`'s, minus half the round trip. `WARN` above 2s |
+| **Signing key** | The file, its mode, whether it is the built-in default, and whether its `kid` is the one being served |
+
+**The exit-code contract**, because a container health probe depends on it:
+
+- **`0`** — every check `OK` or `WARN`. A warning may well be deliberate:
+  `LANYARD_ISSUER=http://lanyard:9500/oidc` looks like a mismatch from your shell
+  and is exactly right for a container network.
+- **non-zero** — any `FAIL`. Today that is a config `serve` would refuse and a
+  server that is not answering.
+- **`--strict`** promotes every `WARN` to a `FAIL`, for CI.
+- **`--quiet`** prints nothing and only sets the exit code. This is what the
+  image's `HEALTHCHECK` runs.
+
+`doctor` needs no running server to be useful: with nothing listening, `Config`
+and `Signing key` still report, `Reachable` fails naming the exact address it
+tried, and the rest are skipped. It never writes anything and never edits your
+configuration — it diagnoses and prints the command.
+
+### `GET /_/health`
+
+Liveness, and only liveness. `200` whenever the process is serving, whatever
+`doctor` thinks, because an application that waits on lanyard must start even
+when the issuer is misconfigured — a misconfigured issuer is exactly the state
+you are trying to debug.
+
+```
+$ curl -s http://127.0.0.1:9500/_/health | jq .
+{
+  "hosts_seen": [],
+  "issuer": "http://127.0.0.1:9500/oidc",
+  "kid": "TXntCt2biz2Bj578hZocZOb2A2nQV9JfrBvFN55QWpU",
+  "now": 1788710020030,
+  "skew": 0,
+  "status": "ok",
+  "version": "0.1.0"
+}
+```
+
+`now` is unix milliseconds, and it is the only reason this returns a body at all:
+it is what makes clock skew measurable between two machines without either of
+them consulting a third. The endpoint emits no log event — a probe every five
+seconds would drown the live request log.
+
+### The `Host` mismatch, at request time
+
+When a request arrives with a `Host` that is not the issuer's authority, lanyard
+says so **once per distinct host** for the life of the process:
+
+```
+warning: reached as "lanyard:9500" but the issuer is "http://127.0.0.1:9500/oidc"
+ — a token minted here says iss=http://127.0.0.1:9500/oidc and a relying party
+ that dialled lanyard:9500 will reject it. Fix with:
+ LANYARD_ISSUER=http://lanyard:9500/oidc lanyard serve
+```
+
+Once per host, not once per request: discovery and JWKS get polled, and a warning
+that repeats is a warning that gets filtered out. It reaches three surfaces from
+one source — the event stream (so `lanyard logs --json` and `/_/log` carry it), a
+band on `/_/`, and `hosts_seen` in `/_/health` so `doctor` reports it from
+outside.
+
+`localhost:9500` against an issuer of `127.0.0.1:9500` **is** a mismatch and gets
+the warning. One rule, no exemptions to remember: a conforming relying party
+compares `iss` as a string, and that one genuinely breaks — it is the single most
+common way this fails, and in .NET it surfaces as `IDX10205`.
+
+Health probes and event-stream connections are not counted, and neither is
+`lanyard doctor` — it dials whatever address you pointed it at, on purpose, and
+reports the mismatch itself.
+
+## Running in a container
+
+```
+$ podman build --format docker -t localhost/lanyard:dev .
+$ podman run --rm -p 9500:9500 localhost/lanyard:dev
+```
+
+The image is `gcr.io/distroless/static-debian12:nonroot` plus one statically
+linked binary — no shell, no curl, no package manager, about 10 MB. It sets
+`LANYARD_BIND=0.0.0.0` and `LANYARD_DATA_DIR=/data` as image defaults, because
+the bind address is a property of the deployment and the image *is* the
+deployment. The native binary keeps its loopback default.
+
+Its `HEALTHCHECK` is `["/lanyard", "doctor", "--quiet"]`. There is nothing else
+in the image to run one with, which is what makes the exit-code contract above
+load-bearing rather than tidy.
+
+> **`--format docker` is not optional.** `podman build` defaults to the OCI image
+> format, which has no `HEALTHCHECK`: the instruction is dropped *silently*, and
+> `podman inspect --format '{{.State.Health.Status}}'` is then simply absent,
+> which reads as a broken health check rather than a missing one.
+
+### One name that resolves from both sides
+
+This is the whole configuration, and it is the answer to almost every container
+gotcha at once:
+
+```
+$ podman network create lanyard-net
+$ podman run -d --name lanyard --network lanyard-net -p 9500:9500 \
+    -e LANYARD_ISSUER=http://lanyard:9500/oidc localhost/lanyard:dev
+$ echo '127.0.0.1 lanyard' | sudo tee -a /etc/hosts
+```
+
+`http://lanyard:9500/oidc` now resolves to the same lanyard from your browser,
+from your shell, and from any container on `lanyard-net` — one string, one
+issuer, no mismatch from any side. `lanyard doctor` verifies it end to end.
+
+> **The `/etc/hosts` line has a sting in the tail, and it is podman's.** Podman
+> copies the host's `/etc/hosts` into every container it starts, so
+> `127.0.0.1 lanyard` lands *inside* your application container too — where it
+> shadows aardvark-dns and resolves `lanyard` to the container itself. The name
+> then works from your browser and your shell and fails from the one place the
+> network was created for, with a connection refused that looks like the IdP
+> being down.
+>
+> Start containers that need to reach lanyard by name with **`--no-hosts`**:
+>
+> ```
+> podman run --rm --no-hosts --network lanyard-net your-app
+> ```
+>
+> The container gets only its network's own resolution, which is what you wanted.
+> Docker does not copy the host file, so this is podman-specific.
+
+For a lanyard running natively on the host with your application in a container,
+the alternative is podman's **`host.containers.internal`** (Docker's
+`host.docker.internal`; native Linux Docker also needs
+`--add-host=host.docker.internal:host-gateway`). `doctor` prints whichever name
+matches the runtime it detects when the issuer's host does not resolve.
+
+### The port is inside the issuer
+
+`-p 9500:8080` publishes the container's 8080 as your 9500, and the issuer still
+says 8080. A browser arrives with `Host: localhost:9500`, gets a token that says
+`iss=http://127.0.0.1:8080/oidc`, and every relying party that dialled `:9500`
+rejects it. `doctor` reports it from the other side, naming both ports:
+
+```
+  Issuer       WARN  the server says 127.0.0.1:8080, I dialled localhost:9500
+                     A token minted here says iss=http://127.0.0.1:8080/oidc, and a relying party that dialled localhost:9500 compares that string and rejects it.
+                     The port is inside the issuer: published as 9500, but the issuer says 8080.
+                     If localhost:9500 is the name everything should use: LANYARD_ISSUER=http://localhost:9500/oidc lanyard serve
+```
+
+### You do not need a volume
+
+The default signing key is deterministic and compiled into the binary, so a fresh
+container with no volume produces the same `kid` and the same public key every
+time — the same one the native binary serves. No volume is declared and none is
+needed. A volume is for someone who has replaced the key with their own.
+
+If you do mount one, ownership is the thing that bites, and it bites in opposite
+directions on the two runtimes. Rootless podman maps the container's `root` to
+you and every other uid into a subuid range, so a directory you own appears
+inside the container as `root`'s and the non-root process cannot write it:
+
+```
+$ podman run -v ./lanyard-data:/data localhost/lanyard:dev
+lanyard: /data is not writable by uid 65532 (this process is in a container).
+  A bind-mounted data directory needs its ownership mapped. Try:
+      podman run -v ./lanyard-data:/data:U …    # podman, rootless
+      docker run --user $(id -u):$(id -g)  …    # docker
+  Or drop the volume entirely: the default signing key is deterministic, so a
+  container with no volume already produces the same kid every time.
+```
+
+`:U` makes the directory writable by chowning it to the mapped subuid — which is
+not you, so you will not be able to read the key back from your shell. To have
+the file end up owned by *you* at mode `0600`, run as yourself:
+
+```
+$ podman run --userns=keep-id --user $(id -u):$(id -g) \
+    -v ./lanyard-data:/data localhost/lanyard:dev
+```
+
+[`scripts/phase08-container.sh`](scripts/phase08-container.sh) drives all of the
+above and asserts each result.
+
 ## Troubleshooting
 
 **.NET: `Exception: Correlation failed.`** — the app is being served from an
@@ -1076,7 +1326,14 @@ front of lanyard that rewrites cookies, that is where to look.
 
 **A relying party rejects the token with an issuer mismatch.** Set
 `LANYARD_ISSUER` to the name your application actually dials. See
-[Read this before you use it](#read-this-before-you-use-it).
+[Read this before you use it](#read-this-before-you-use-it) — and run
+[`lanyard doctor`](#lanyard-doctor), which names both sides and prints the line
+that fixes it.
+
+**Anything else about containers, ports, names or clocks.** Run
+[`lanyard doctor`](#lanyard-doctor). It is one command whose output can be pasted
+into an issue, and it exists because knowing *which* of these six things went
+wrong is the entire problem.
 
 ## Verifying a token
 

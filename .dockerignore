@@ -1,0 +1,36 @@
+# **The build context is the source, not the workspace.** `target/` alone is
+# several gigabytes, and every byte of it is uploaded to the build before the
+# first instruction runs.
+target
+**/target
+debug
+
+# Version control and the build's own inputs.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# The spikes are how the repository is *verified*; they are not how the crate
+# builds. Their vendor trees — node_modules, obj/bin, vendor/ — are the bulk of
+# them and none of it reaches the binary.
+spikes
+scripts/node_modules
+
+# The zero sources, tests and coverage output. `web/dist/` is deliberately NOT
+# here: it is what `rust-embed` compiles into the binary, and a build without it
+# produces a lanyard whose UI 404s.
+web/src
+web/styles
+web/coverage
+web/mutation
+web/node_modules
+web/index.html
+web/tsconfig.json
+web/AGENTS.md
+
+# Documentation and editor state.
+docs
+.claude
+CONCEPT.md
+ROADMAP.md

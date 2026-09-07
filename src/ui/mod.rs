@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::app::SharedState;
+use crate::clock::Clock;
 use crate::oidc::authorize;
 use crate::oidc::revocation;
 use crate::oidc::token::Form;
@@ -120,6 +121,7 @@ fn persona_list(
     // half way down one page.
     let people = state.personas.resolve();
     let mut out = warning_band(&people);
+    out.push_str(&host_band(&state.hosts.seen(), &state.config.issuer));
 
     match req {
         Some((_, client_id)) => out.push_str(&format!(
@@ -168,7 +170,12 @@ fn persona_list(
     }
 
     out.push_str(&mint_panel(req.map(|(id, _)| id)));
-    out.push_str(&this_browser_panel(&people, req.map(|(id, _)| id), browser));
+    out.push_str(&this_browser_panel(
+        state.clock,
+        &people,
+        req.map(|(id, _)| id),
+        browser,
+    ));
     out.push_str(
         "<footer class=\"text-small\">lanyard · sessions live in memory, so restarting \
          lanyard logs everybody out. · <a href=\"/_/log\">live log</a></footer>\n",
@@ -201,6 +208,33 @@ fn warning_band(people: &Resolved) -> String {
     }
     out.push_str(
         "<p class=\"lede text-small\">Every other source still loaded. <code>lanyard links</code> lists every linked project and its state.</p>\n</div>\n",
+    );
+    out
+}
+
+/// **A band naming every name this lanyard has been reached by that is not the
+/// issuer's**, and the `LANYARD_ISSUER=` line that fixes each.
+///
+/// Phase 7's band shape, reused rather than reinvented — but its own band and
+/// its own heading, because "some personas could not be loaded" is not what
+/// happened here.
+fn host_band(seen: &[String], issuer: &str) -> String {
+    if seen.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<div class=\"warn card stack gap-sm pad-md border\">\n\
+         <h2 class=\"text-eyebrow\">Reached by a name the issuer does not claim</h2>\n",
+    );
+    for host in seen {
+        out.push_str(&format!(
+            "<p class=\"text-small\">{}</p>\n",
+            html::escape(&crate::hosts::warning(issuer, host))
+        ));
+    }
+    out.push_str(
+        "<p class=\"lede text-small\">The issuer is one string and this machine has more than \
+         one address. <code>lanyard doctor</code> reports which side sees what.</p>\n</div>\n",
     );
     out
 }
@@ -358,7 +392,12 @@ impl Browser {
 /// On both versions of the page — with a login in progress and without — because
 /// the question "who does this browser think I am" is the one a developer opens
 /// this page to answer, and a login in progress is not a reason to hide it.
-fn this_browser_panel(people: &Resolved, req: Option<&str>, browser: &Browser) -> String {
+fn this_browser_panel(
+    clock: Clock,
+    people: &Resolved,
+    req: Option<&str>,
+    browser: &Browser,
+) -> String {
     let mut out = String::from("<h2 class=\"text-eyebrow\">This browser</h2>\n");
 
     if browser.signed_in.is_empty() {
@@ -368,7 +407,7 @@ fn this_browser_panel(people: &Resolved, req: Option<&str>, browser: &Browser) -
         );
     }
     for (client_id, selection) in &browser.signed_in {
-        out.push_str(&signed_in_row(people, req, client_id, selection));
+        out.push_str(&signed_in_row(clock, people, req, client_id, selection));
     }
 
     // **Log out of lanyard**: the whole session, every selection and every
@@ -410,6 +449,7 @@ fn this_browser_panel(people: &Resolved, req: Option<&str>, browser: &Browser) -
 /// named by its id rather than dropped — the selection is real even when the
 /// file it came from changed underneath it.
 fn signed_in_row(
+    clock: Clock,
     people: &Resolved,
     req: Option<&str>,
     client_id: &str,
@@ -445,7 +485,7 @@ fn signed_in_row(
          keep the persona, so its own renew path runs\">Expire now</button></form>\n\
          </div>\n",
         client = html::escape(client_id),
-        when = html::escape(&ago(selection.auth_time)),
+        when = html::escape(&ago(clock, selection.auth_time)),
         back = back_field(req),
     )
 }
@@ -466,8 +506,8 @@ fn back_field(req: Option<&str>) -> String {
 /// How long ago, in the words a person would use. `auth_time` is unix seconds
 /// and may predate this process, so a negative difference reads as "just now"
 /// rather than as an enormous number.
-fn ago(unix_seconds: u64) -> String {
-    let elapsed = unix_now().saturating_sub(unix_seconds);
+fn ago(clock: Clock, unix_seconds: u64) -> String {
+    let elapsed = clock.now().saturating_sub(unix_seconds);
     match elapsed {
         0..=44 => "just now".to_string(),
         45..=5399 => {
@@ -553,7 +593,7 @@ async fn pick(State(state): State<SharedState>, headers: HeaderMap, body: Bytes)
         },
     };
 
-    let auth_time = unix_now();
+    let auth_time = state.clock.now();
     let session_id = {
         let mut sessions = state.stores.sessions.lock().expect("sessions");
         let id = sessions.ensure(session::from_headers(&headers).as_deref());
@@ -737,13 +777,6 @@ pub fn with_session_cookie(mut response: Response, session_id: &str) -> Response
     response
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,12 +786,17 @@ mod tests {
     /// backwards must read as "just now" rather than as an enormous number.
     #[test]
     fn ago_reads_in_the_words_a_person_would_use() {
-        let now = unix_now();
-        assert_eq!(ago(now), "just now");
-        assert_eq!(ago(now + 500), "just now", "a future auth_time saturates");
-        assert_eq!(ago(now - 44), "just now");
-        assert_eq!(ago(now - 60), "1 minute ago");
-        assert_eq!(ago(now - 150), "3 minutes ago");
-        assert_eq!(ago(now - 7200), "2 hours ago");
+        let clock = Clock::real();
+        let now = clock.now();
+        assert_eq!(ago(clock, now), "just now");
+        assert_eq!(
+            ago(clock, now + 500),
+            "just now",
+            "a future auth_time saturates"
+        );
+        assert_eq!(ago(clock, now - 44), "just now");
+        assert_eq!(ago(clock, now - 60), "1 minute ago");
+        assert_eq!(ago(clock, now - 150), "3 minutes ago");
+        assert_eq!(ago(clock, now - 7200), "2 hours ago");
     }
 }

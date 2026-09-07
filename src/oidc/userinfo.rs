@@ -55,7 +55,7 @@ async fn userinfo(State(state): State<SharedState>, headers: HeaderMap) -> Respo
         return unauthorized("no bearer token was presented");
     };
 
-    let claims = match jws::verify(&state.key, &state.config.issuer, &token) {
+    let claims = match jws::verify(&state.key, state.clock, &state.config.issuer, &token) {
         Ok(claims) => claims,
         Err(message) => return unauthorized(&message),
     };

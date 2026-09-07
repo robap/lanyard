@@ -31,9 +31,11 @@ async fn spawn_with(personas: Personas) -> String {
     let state = Arc::new(AppState {
         config,
         key,
+        clock: lanyard_cli::clock::Clock::real(),
         personas: Registry::fixed(personas),
         stores: Stores::default(),
-        events: lanyard_cli::events::EventBus::new(),
+        events: lanyard_cli::events::EventBus::new(lanyard_cli::clock::Clock::real()),
+        hosts: lanyard_cli::hosts::HostSightings::default(),
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

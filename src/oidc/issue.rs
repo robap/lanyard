@@ -7,6 +7,7 @@
 
 use serde_json::{Map, Value};
 
+use crate::clock::{Clock, LEEWAY};
 use crate::keys::SigningKey;
 use crate::oidc::flaw::{self, Flaw};
 use crate::oidc::jws;
@@ -54,8 +55,10 @@ pub struct Issued {
 }
 
 /// Mint a signed token and hand back the exact claims that were signed.
+#[allow(clippy::too_many_arguments)]
 pub fn issue(
     key: &SigningKey,
+    clock: Clock,
     issuer: &str,
     persona: Option<&Persona>,
     overrides: &Map<String, Value>,
@@ -63,7 +66,7 @@ pub fn issue(
     flaw: Option<Flaw>,
     filter: &ClaimFilter,
 ) -> Result<Issued, String> {
-    let issued_at = unix_now();
+    let issued_at = clock.now();
     let claims = claims_at(
         issued_at,
         issuer,
@@ -118,7 +121,13 @@ pub fn claims_at(
     //    move the issuer — the body is the documented override channel.
     claims.insert("iss".into(), Value::from(issuer));
     claims.insert("iat".into(), Value::from(now));
-    claims.insert("nbf".into(), Value::from(now));
+    // **`nbf` is backdated, and only `nbf`.** A relying party whose clock is a
+    // second or two behind must not reject a token that is a second old.
+    // Extending `exp` would have the same effect and is the wrong lever: it
+    // would silently lengthen a TTL that is 60 seconds on purpose (CONCEPT §6),
+    // and a 60-second token that gets rejected is lanyard working. `iat` is a
+    // statement of fact and does not move either.
+    claims.insert("nbf".into(), Value::from(now.saturating_sub(LEEWAY)));
     claims.insert("exp".into(), Value::from(now.saturating_add(ttl)));
     claims.insert("jti".into(), Value::from(jti));
 
@@ -141,7 +150,9 @@ pub fn claims_at(
         Some(Flaw::Expired) => {
             let iat = now.saturating_sub(flaw::EXPIRED_SHIFT);
             claims.insert("iat".into(), Value::from(iat));
-            claims.insert("nbf".into(), Value::from(iat));
+            // Leeway and all, so `nbf` is five seconds before `iat` in every
+            // token lanyard mints rather than in most of them.
+            claims.insert("nbf".into(), Value::from(iat.saturating_sub(LEEWAY)));
             claims.insert("exp".into(), Value::from(iat.saturating_add(ttl)));
         }
         // `wrong-<requested>` cannot collide with what was asked for and reads
@@ -211,12 +222,4 @@ pub fn persona_claims(p: &Persona, filter: &ClaimFilter) -> Map<String, Value> {
 
 fn new_jti() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-fn unix_now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

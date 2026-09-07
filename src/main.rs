@@ -5,6 +5,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use lanyard_cli::app::{self, AppState};
 use lanyard_cli::client::{self, MintRequest};
+use lanyard_cli::clock::Clock;
 use lanyard_cli::links::Links;
 use lanyard_cli::oidc::flaw::Flaw;
 use lanyard_cli::persona::Personas;
@@ -39,6 +40,23 @@ enum Command {
     Unlink(LinkArgs),
     /// List every linked persona file, its client, and its personas
     Links,
+    /// Check this machine's lanyard and say what is wrong with it
+    Doctor(DoctorArgs),
+}
+
+#[derive(Args)]
+struct DoctorArgs {
+    /// Where lanyard is listening. An address, not the issuer
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+
+    /// Treat every WARN as a failure. For CI
+    #[arg(long)]
+    strict: bool,
+
+    /// Print nothing; only set the exit code. What the image's HEALTHCHECK runs
+    #[arg(long)]
+    quiet: bool,
 }
 
 #[derive(Args)]
@@ -133,6 +151,14 @@ impl MintArgs {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // **`doctor` owns its own exit code.** The report *is* the output, and a
+    // second `lanyard: …` line under a `FAIL` would be noise — on a probe that
+    // prints nothing by design, it would be the only output there was.
+    if let Command::Doctor(args) = &cli.command {
+        return doctor(args).await;
+    }
+
     let result = match cli.command {
         Command::Serve => serve().await,
         // Both write one line to stdout and nothing else. A stray banner or
@@ -154,6 +180,8 @@ async fn main() -> ExitCode {
         Command::Link(args) => link(&args),
         Command::Unlink(args) => unlink(&args),
         Command::Links => list_links(),
+        // Handled above, where it can return its own exit code.
+        Command::Doctor(_) => unreachable!(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -185,6 +213,34 @@ async fn mint(args: &MintArgs) -> Result<String, String> {
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// The eighth subcommand: six checks, one line each, and an exit code a
+/// container health probe can depend on.
+///
+/// **Only a `FAIL` is non-zero.** The image's `HEALTHCHECK` is this command, so
+/// a container must not stay unhealthy over a warning that may well be
+/// deliberate — see [`lanyard_cli::doctor::Report::failed`].
+async fn doctor(args: &DoctorArgs) -> ExitCode {
+    let url = match client::resolve_url(args.url.as_deref(), |key| std::env::var(key).ok()) {
+        Ok(url) => url,
+        Err(message) => {
+            // Before any check runs, so this is the ordinary error path rather
+            // than a `FAIL` line about a URL that was never formed.
+            eprintln!("lanyard: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report = lanyard_cli::doctor::run(&url, &Config::from_env()).await;
+    if !args.quiet {
+        print!("{}", report.render());
+    }
+    if report.failed(args.strict) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The fourth subcommand, and the second thing the CLI does over HTTP against
@@ -351,6 +407,10 @@ fn list_links() -> Result<(), String> {
 
 async fn serve() -> Result<(), String> {
     let config = Config::from_env()?;
+    // Built once and handed to the state, the bus and every mint. Two places
+    // that read the clock is the same drift north star 3 exists to prevent, one
+    // layer down.
+    let clock = Clock::skewed(config.skew);
 
     // Everything that can be fatal happens before the port is taken, so a bad
     // key or a bad personas file never leaves a half-started server listening.
@@ -380,6 +440,7 @@ async fn serve() -> Result<(), String> {
             listen: &addr,
             data_dir: &config.data_dir.display().to_string(),
             kid: key.kid(),
+            clock,
             sources: &resolved.sources,
             warnings: &resolved.warnings,
         })
@@ -388,9 +449,11 @@ async fn serve() -> Result<(), String> {
     let state = Arc::new(AppState {
         config,
         key,
+        clock,
         personas,
         stores: Stores::default(),
-        events: lanyard_cli::events::EventBus::new(),
+        events: lanyard_cli::events::EventBus::new(clock),
+        hosts: lanyard_cli::hosts::HostSightings::default(),
     });
 
     axum::serve(listener, app::router(state))

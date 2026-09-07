@@ -182,9 +182,9 @@ fn authorize(state: &SharedState, headers: &HeaderMap, form: Form) -> Response {
     let usable = remembered.filter(|selection| {
         !always_ask
             && request.prompt != Some(Prompt::Ask)
-            && request
-                .max_age
-                .is_none_or(|max_age| unix_now().saturating_sub(selection.auth_time) <= max_age)
+            && request.max_age.is_none_or(|max_age| {
+                state.clock.now().saturating_sub(selection.auth_time) <= max_age
+            })
     });
 
     // **`prompt=none` renders nothing, ever.** Not because silent renew works
@@ -296,13 +296,6 @@ fn with_optional_cookie(response: Response, session_id: Option<String>) -> Respo
         Some(id) => crate::ui::with_session_cookie(response, &id),
         None => response,
     }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Either a page lanyard renders itself, or a redirect carrying an OAuth error

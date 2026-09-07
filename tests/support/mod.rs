@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use lanyard_cli::app::{self, AppState};
+use lanyard_cli::clock::Clock;
 use lanyard_cli::config::Config;
 use lanyard_cli::events::EventBus;
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
@@ -66,23 +67,71 @@ pub async fn spawn_observed(personas: Personas, stores: Stores) -> (String, Even
 }
 
 pub async fn spawn_observed_registry(personas: Registry, stores: Stores) -> (String, EventBus) {
+    spawn_clocked(Clock::real(), personas, stores).await
+}
+
+/// A server on a **deliberately wrong clock**, and its bus.
+///
+/// This is the reason [`Clock`] is a value on `AppState` rather than a global:
+/// a skewed server and an unskewed one live in the same test binary, which a
+/// `OnceLock` could not have allowed.
+pub async fn spawn_skewed(skew: i64) -> (String, EventBus) {
+    spawn_clocked(
+        Clock::skewed(skew),
+        Registry::fixed(Personas::builtin()),
+        Stores::default(),
+    )
+    .await
+}
+
+pub async fn spawn_clocked(clock: Clock, personas: Registry, stores: Stores) -> (String, EventBus) {
+    spawn_full(clock, personas, stores, false).await
+}
+
+/// A server whose **issuer is the address it is actually listening on**.
+///
+/// Every other spawn here keeps the canonical `:9500` issuer while binding an
+/// ephemeral port, which is right for tests about grants and wrong for a test
+/// about `lanyard doctor`: the mismatch that arrangement creates is the very
+/// thing `doctor` reports. This one has nothing to report.
+pub async fn spawn_self_consistent() -> (String, EventBus) {
+    spawn_full(
+        Clock::real(),
+        Registry::fixed(Personas::builtin()),
+        Stores::default(),
+        true,
+    )
+    .await
+}
+
+async fn spawn_full(
+    clock: Clock,
+    personas: Registry,
+    stores: Stores,
+    issuer_follows_the_port: bool,
+) -> (String, EventBus) {
+    // Bound first, because the issuer may have to name the port it got.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let issuer = format!("http://{addr}/oidc");
     let config = Config::resolve(|key| match key {
         "HOME" => Some("/nonexistent".to_string()),
+        "LANYARD_ISSUER" if issuer_follows_the_port => Some(issuer.clone()),
         _ => None,
     })
     .unwrap();
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
-    let events = EventBus::new();
+    let events = EventBus::new(clock);
     let state = Arc::new(AppState {
         config,
         key,
+        clock,
         personas,
         stores,
         events: events.clone(),
+        hosts: lanyard_cli::hosts::HostSightings::default(),
     });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app::router(state)).await.unwrap();
     });
@@ -225,13 +274,27 @@ pub fn stderr(output: &std::process::Output) -> String {
 /// A client that stops at the first response. Following a `302` to
 /// `http://localhost:5000` in a test would try to reach a .NET app that is not
 /// running, and the interesting thing was the header anyway.
+/// **Sends the issuer's own authority as `Host`.**
+///
+/// The harness binds an ephemeral port while the issuer stays the canonical
+/// `:9500`, so without this every request would be a genuine `Host` mismatch —
+/// an artifact of the harness, not of the thing under test, and one that would
+/// hang a Phase 8 warning off events in tests about grants and personas.
+/// `tests/hosts.rs` overrides it per request, which is what a per-request
+/// header does to a default one.
 pub fn client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::HOST, ISSUER_AUTHORITY.parse().unwrap());
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .cookie_store(true)
+        .default_headers(headers)
         .build()
         .unwrap()
 }
+
+/// The authority half of [`ISSUER`].
+pub const ISSUER_AUTHORITY: &str = "127.0.0.1:9500";
 
 pub async fn authorize(base: &str, query: &str) -> reqwest::Response {
     client()

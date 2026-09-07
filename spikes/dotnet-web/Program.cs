@@ -27,7 +27,13 @@ builder.Services
         // Phase 4 repointed this spike from Phase 0's `oidc-provider-mock` at
         // :9400 to lanyard itself. The DROP= subtraction harness is unchanged —
         // a setting nobody removed is still not evidence of a minimum.
-        if (Keep("Authority")) options.Authority = "http://127.0.0.1:9500/oidc";
+        // Phase 8 added the environment override. The default is unchanged, and
+        // the reason for the knob is criterion 18: the one-name setup points
+        // every side at `http://lanyard:9500/oidc`, and a hard-coded authority
+        // is a side that cannot be pointed.
+        if (Keep("Authority"))
+            options.Authority = Environment.GetEnvironmentVariable("LANYARD_AUTHORITY")
+                ?? "http://127.0.0.1:9500/oidc";
         if (Keep("RequireHttpsMetadata")) options.RequireHttpsMetadata = false;
         // Nothing was registered with lanyard. This client id was invented here
         // and lanyard has never heard of it.

@@ -3,6 +3,7 @@
 
 use serde_json::{json, Map, Value};
 
+use lanyard_cli::clock::{Clock, LEEWAY};
 use lanyard_cli::keys::{SigningKey, DEFAULT_DEV_KEY_PEM};
 use lanyard_cli::oidc::flaw::{Flaw, EXPIRED_SHIFT, WRONG_ISSUER};
 use lanyard_cli::oidc::issue::{claims_at, issue, DEFAULT_TTL};
@@ -41,9 +42,34 @@ fn the_registered_claims_are_always_present() {
 
     assert_eq!(c["iss"], ISSUER);
     assert_eq!(c["iat"], NOW);
-    assert_eq!(c["nbf"], NOW, "nbf tracks iat");
     assert_eq!(c["exp"], NOW + DEFAULT_TTL);
     assert_eq!(c["jti"], "test-jti");
+}
+
+/// **`nbf` is backdated, and only `nbf`.** A relying party whose clock is a
+/// second or two behind must not reject a token that is a second old — and
+/// extending `exp` instead would silently lengthen a TTL that is 60 seconds on
+/// purpose (CONCEPT §6).
+#[test]
+fn nbf_is_backdated_by_the_leeway_and_nothing_else_moves() {
+    let c = mint(None, json!({"sub": "ada"}), DEFAULT_TTL);
+
+    assert_eq!(c["nbf"], NOW - LEEWAY, "nbf is iat minus the leeway");
+    assert_eq!(
+        c["iat"], NOW,
+        "iat is a statement of fact and does not move"
+    );
+    assert_eq!(
+        c["exp"],
+        NOW + DEFAULT_TTL,
+        "extending exp would lengthen a TTL that is 60 seconds on purpose"
+    );
+    // Phase 2's criterion is that the same call 90 seconds later is a 401:
+    // 60 seconds of life plus 5 of leeway is 65, and 90 is still past it.
+    assert!(
+        c["exp"].as_u64().unwrap() + LEEWAY < NOW + 90,
+        "the 90-second rejection must still happen"
+    );
 }
 
 #[test]
@@ -153,6 +179,7 @@ fn issuing_signs_the_claims_it_returns() {
     let personas = Personas::builtin();
     let issued = issue(
         &key,
+        Clock::real(),
         ISSUER,
         personas.get("ada"),
         &overrides(json!({"aud": "billing-api"})),
@@ -180,6 +207,7 @@ fn each_token_gets_its_own_jti() {
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
     let a = issue(
         &key,
+        Clock::real(),
         ISSUER,
         None,
         &Map::new(),
@@ -190,6 +218,7 @@ fn each_token_gets_its_own_jti() {
     .unwrap();
     let b = issue(
         &key,
+        Clock::real(),
         ISSUER,
         None,
         &Map::new(),
@@ -226,7 +255,11 @@ fn expired_outranks_an_exp_the_body_posted() {
     );
 
     assert_eq!(c["iat"], NOW - EXPIRED_SHIFT);
-    assert_eq!(c["nbf"], NOW - EXPIRED_SHIFT, "nbf moves with iat");
+    assert_eq!(
+        c["nbf"],
+        NOW - EXPIRED_SHIFT - LEEWAY,
+        "the whole token shifts back, leeway and all"
+    );
     assert_eq!(
         c["exp"],
         NOW - EXPIRED_SHIFT + DEFAULT_TTL,
@@ -320,6 +353,7 @@ fn issuing_hands_back_the_moment_it_used() {
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
     let issued = issue(
         &key,
+        Clock::real(),
         ISSUER,
         None,
         &Map::new(),
@@ -339,6 +373,7 @@ fn issuing_expired_signs_the_shifted_claims() {
     let key = SigningKey::from_pem(DEFAULT_DEV_KEY_PEM).unwrap();
     let issued = issue(
         &key,
+        Clock::real(),
         ISSUER,
         None,
         &Map::new(),

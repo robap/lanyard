@@ -2,6 +2,7 @@
 //! first eight lines of output, so this prints where every moving part came
 //! from.
 
+use crate::clock::{format_offset, Clock, SKEW_VAR};
 use crate::persona::Origin;
 use crate::registry::{SourceState, Warning};
 
@@ -19,6 +20,10 @@ pub struct Banner<'a> {
     pub listen: &'a str,
     pub data_dir: &'a str,
     pub kid: &'a str,
+    /// **Only printed when it is wrong.** A dev tool may lie about the time; it
+    /// may not do so quietly — so a skewed process says so on the first screen
+    /// of output, and names what the lie does to a 60-second token.
+    pub clock: Clock,
     /// **One line each**, in precedence order — the built-ins or the global
     /// file, then every linked project. A source that gave nothing is on the
     /// list saying why rather than omitted: "why is Ada not there" has to stay
@@ -40,7 +45,7 @@ pub fn render(b: &Banner) -> String {
          Listening → {}\n  \
          Data dir  → {}\n  \
          Signing   → kid {}\n\
-         {}{}",
+         {}{}{}",
         env!("CARGO_PKG_VERSION"),
         b.issuer,
         b.ui,
@@ -48,9 +53,36 @@ pub fn render(b: &Banner) -> String {
         b.listen,
         b.data_dir,
         b.kid,
+        clock_block(b.clock),
         personas_block(b.sources),
         warnings_block(b.sources, b.warnings),
     )
+}
+
+/// The `Clock →` line, and **nothing at all** when the clock is the machine's.
+///
+/// An unskewed run is every run, and a line that says "normal" on every run is
+/// a line nobody reads — which is the same argument that keeps the warning band
+/// off a page with no warnings.
+fn clock_block(clock: Clock) -> String {
+    if !clock.is_skewed() {
+        return String::new();
+    }
+    // The consequence, not just the number: "skewed -5m0s" leaves the reader to
+    // do the arithmetic that is the entire reason the line exists.
+    let offset = format_offset(clock.skew_seconds());
+    let consequence = if clock.skew_seconds() < 0 {
+        format!(
+            "tokens minted here are already expired by {} for anything\n\
+             \x20             on a correct clock",
+            format_offset(clock.skew_seconds().saturating_add(60).min(0)).trim_start_matches('-'),
+        )
+    } else {
+        "tokens minted here are not valid yet for anything\n\
+         \x20             on a correct clock"
+            .to_string()
+    };
+    format!("  Clock     → skewed {offset} ({SKEW_VAR}) — {consequence}\n")
 }
 
 /// "Why is Ada not there" is answered here: every source, in the order the
@@ -115,6 +147,10 @@ mod tests {
     }
 
     fn sample_with(sources: &[SourceState], warnings: &[Warning]) -> String {
+        sample_clocked(Clock::real(), sources, warnings)
+    }
+
+    fn sample_clocked(clock: Clock, sources: &[SourceState], warnings: &[Warning]) -> String {
         render(&Banner {
             issuer: "http://lanyard:9500/oidc",
             ui: "http://lanyard:9500/_/",
@@ -122,9 +158,18 @@ mod tests {
             listen: "0.0.0.0:9500",
             data_dir: "/tmp/lanyard-data",
             kid: "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs",
+            clock,
             sources,
             warnings,
         })
+    }
+
+    fn builtin() -> [SourceState; 1] {
+        [SourceState {
+            origin: Origin::BuiltIn,
+            ids: vec!["ada".into()],
+            error: None,
+        }]
     }
 
     fn line_with(out: &str, label: &str) -> String {
@@ -151,6 +196,40 @@ mod tests {
         assert!(line_with(&out, "Log").ends_with("http://lanyard:9500/_/log"));
         assert!(line_with(&out, "Data dir").contains("/tmp/lanyard-data"));
         assert!(line_with(&out, "Signing").contains("NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"));
+    }
+
+    /// A dev tool may lie about the time; it may not do so quietly. The line
+    /// names the offset, the variable that produced it, and what it does to a
+    /// 60-second token — the arithmetic is the reason the line exists.
+    #[test]
+    fn a_skewed_clock_gets_a_line_naming_the_variable_and_the_consequence() {
+        let out = sample_clocked(Clock::skewed(-300), &builtin(), &[]);
+        let line = line_with(&out, "Clock");
+        assert!(line.contains("-5m0s"), "{line}");
+        assert!(line.contains("LANYARD_CLOCK_SKEW"), "{line}");
+        assert!(
+            out.contains("already expired by 4m0s"),
+            "the consequence, not just the number:\n{out}"
+        );
+    }
+
+    /// Every ordinary run is unskewed, and a line that says "normal" on every
+    /// run is a line nobody reads.
+    #[test]
+    fn an_unskewed_clock_prints_no_line_at_all() {
+        let out = sample_clocked(Clock::real(), &builtin(), &[]);
+        assert!(!out.contains("Clock"), "{out}");
+        assert!(!out.contains("LANYARD_CLOCK_SKEW"), "{out}");
+    }
+
+    /// A clock that runs fast mints tokens nothing else will accept yet, which
+    /// is a different sentence from the one a slow clock earns.
+    #[test]
+    fn a_clock_that_runs_fast_says_not_valid_yet() {
+        let out = sample_clocked(Clock::skewed(300), &builtin(), &[]);
+        let line = line_with(&out, "Clock");
+        assert!(line.contains("+5m0s"), "{line}");
+        assert!(out.contains("not valid yet"), "{out}");
     }
 
     #[test]

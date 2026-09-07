@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use axum::Router;
 
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::events::EventBus;
+use crate::hosts::HostSightings;
 use crate::keys::SigningKey;
 use crate::registry::Registry;
 use crate::store::Stores;
@@ -13,6 +15,11 @@ use crate::store::Stores;
 pub struct AppState {
     pub config: Config,
     pub key: SigningKey,
+    /// **The process's one clock**, and the reason `src/clock.rs` holds the only
+    /// `SystemTime::now()` in the crate. Injected rather than global so a test
+    /// binary can spawn a skewed server and an unskewed one at the same time —
+    /// which a `OnceLock` could not.
+    pub clock: Clock,
     /// **Not a list — a merged view of many sources, re-resolved on demand.**
     /// Phase 7 replaced an immutable field with this so that editing a linked
     /// project's `lanyard.yaml` needs no restart; every handler that needs
@@ -27,6 +34,10 @@ pub struct AppState {
     /// ring of what already happened, which nothing reads back to make a
     /// decision.
     pub events: EventBus,
+    /// Every distinct `Host` that did not match the issuer's authority, in the
+    /// order it was first seen. The second piece of interior mutability here
+    /// after `stores`, and like those it dies with the process.
+    pub hosts: HostSightings,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -46,6 +57,7 @@ pub fn router(state: SharedState) -> Router {
             "/_",
             crate::seam::routes()
                 .merge(crate::api::routes())
+                .merge(crate::health::routes())
                 .merge(crate::embed::routes())
                 .merge(crate::ui::routes()),
         )

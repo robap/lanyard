@@ -20,11 +20,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
+
+use crate::clock::Clock;
 
 /// One captured request: what was asked, what was decided, what came out.
 ///
@@ -106,6 +107,10 @@ const CHANNEL_CAPACITY: usize = 1024;
 
 struct Inner {
     tx: broadcast::Sender<BusSignal>,
+    /// **The bus timestamps with the process's clock, not with the machine's.**
+    /// A skewed lanyard whose log contradicted the tokens it was describing
+    /// would be worse than no log at all.
+    clock: Clock,
     ring: Mutex<VecDeque<Event>>,
     next_id: AtomicU64,
     capacity: usize,
@@ -118,15 +123,16 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    pub fn new() -> Self {
-        Self::with_capacity(RING_CAPACITY)
+    pub fn new(clock: Clock) -> Self {
+        Self::with_capacity(clock, RING_CAPACITY)
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(clock: Clock, capacity: usize) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 tx,
+                clock,
                 ring: Mutex::new(VecDeque::with_capacity(capacity.min(64))),
                 next_id: AtomicU64::new(1),
                 capacity,
@@ -142,7 +148,7 @@ impl EventBus {
     pub fn publish(&self, draft: EventDraft) -> Event {
         let event = Event {
             id: self.inner.next_id.fetch_add(1, Ordering::Relaxed),
-            ts: now_millis(),
+            ts: self.inner.clock.now_millis(),
             client_id: draft.client_id,
             endpoint: draft.endpoint,
             method: draft.method,
@@ -193,19 +199,6 @@ impl EventBus {
             .collect();
         (backlog, rx)
     }
-}
-
-impl Default for EventBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// The aligned stdout line. **A developer who never opens the UI still gets the
@@ -382,7 +375,7 @@ mod tests {
 
     #[test]
     fn ids_are_monotonic_from_one() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let a = bus.publish(draft("/oidc/token"));
         let b = bus.publish(draft("/oidc/token"));
         assert_eq!(a.id, 1);
@@ -392,7 +385,7 @@ mod tests {
 
     #[test]
     fn the_ring_caps_at_capacity_and_drops_the_oldest() {
-        let bus = EventBus::with_capacity(3);
+        let bus = EventBus::with_capacity(Clock::real(), 3);
         for _ in 0..5 {
             bus.publish(draft("/oidc/token"));
         }
@@ -404,7 +397,7 @@ mod tests {
 
     #[test]
     fn subscribe_replays_strictly_after_the_given_id() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         for _ in 0..4 {
             bus.publish(draft("/oidc/token"));
         }
@@ -415,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_subscriber_receives_what_is_published_after_it_subscribed() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let (_backlog, mut rx) = bus.subscribe(None);
         let published = bus.publish(draft("/oidc/authorize"));
         match rx.recv().await.unwrap() {
@@ -429,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_empties_the_ring_and_tells_live_subscribers() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         bus.publish(draft("/oidc/token"));
         let (_backlog, mut rx) = bus.subscribe(None);
 
@@ -449,7 +442,7 @@ mod tests {
     fn pretty_puts_the_whole_error_description_on_the_line() {
         let description = "the code_verifier does not match the S256 code_challenge \
                            this code was issued against";
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             endpoint: "/oidc/token".to_owned(),
             status: 400,
@@ -470,7 +463,7 @@ mod tests {
 
     #[test]
     fn pretty_names_the_grant_and_what_it_minted() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             client_id: Some("lanyard-cli".to_owned()),
             grant_type: Some("client_credentials".to_owned()),
@@ -491,7 +484,7 @@ mod tests {
 
     #[test]
     fn pretty_names_the_persona_the_scopes_and_the_pkce_method_on_an_authorize() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             method: "GET".to_owned(),
             status: 302,
@@ -512,7 +505,7 @@ mod tests {
     /// verifier and no `scope`; the grant is on the token that came out.
     #[test]
     fn pretty_names_the_granted_scopes_even_when_the_request_did_not() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             grant_type: Some("authorization_code".to_owned()),
             request: obj(json!({ "code": "8Xk2", "code_verifier": "dBjftJeZ" })),
@@ -532,7 +525,7 @@ mod tests {
     /// narrowed grant should read as the narrowing.
     #[test]
     fn a_requested_scope_is_preferred_over_the_tokens_own() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             request: obj(json!({ "scope": ["openid"] })),
             issued: obj(json!({
@@ -546,7 +539,7 @@ mod tests {
 
     #[test]
     fn pretty_names_the_flaw_when_one_was_asked_for() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(EventDraft {
             flaw: Some("alg-none".to_owned()),
             ..draft("/oidc/token")
@@ -561,7 +554,7 @@ mod tests {
     /// than that field".
     #[test]
     fn every_event_carries_the_whole_shape_with_nulls_for_what_did_not_happen() {
-        let bus = EventBus::new();
+        let bus = EventBus::new(Clock::real());
         let e = bus.publish(draft("/oidc/token"));
         let json: Value = serde_json::to_value(&e).unwrap();
         for field in [

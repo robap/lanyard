@@ -18,6 +18,7 @@ use rsa::traits::PublicKeyParts as _;
 use rsa::RsaPrivateKey;
 
 use crate::b64;
+use crate::runtime::Runtime;
 
 /// Committed on purpose. See the module comment.
 pub const DEFAULT_DEV_KEY_PEM: &str = include_str!("default-dev-key.pem");
@@ -82,16 +83,22 @@ pub fn load_or_create(data_dir: &Path) -> Result<SigningKey, String> {
     let path = key_path(data_dir);
 
     if !path.exists() {
-        fs::create_dir_all(data_dir)
-            .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+        fs::create_dir_all(data_dir).map_err(|e| {
+            denied_or(e, data_dir, |e| {
+                format!("cannot create data dir {}: {e}", data_dir.display())
+            })
+        })?;
 
         let gitignore = data_dir.join(".gitignore");
         if !gitignore.exists() {
-            fs::write(&gitignore, "*\n")
-                .map_err(|e| format!("cannot write {}: {e}", gitignore.display()))?;
+            fs::write(&gitignore, "*\n").map_err(|e| {
+                denied_or(e, data_dir, |e| {
+                    format!("cannot write {}: {e}", gitignore.display())
+                })
+            })?;
         }
 
-        write_private(&path, DEFAULT_DEV_KEY_PEM)?;
+        write_private(&path, data_dir, DEFAULT_DEV_KEY_PEM)?;
     }
 
     let pem =
@@ -105,7 +112,7 @@ pub fn load_or_create(data_dir: &Path) -> Result<SigningKey, String> {
 
 /// Write at mode 0600 from the start, rather than creating world-readable and
 /// tightening afterwards.
-fn write_private(path: &Path, contents: &str) -> Result<(), String> {
+fn write_private(path: &Path, data_dir: &Path, contents: &str) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -114,9 +121,87 @@ fn write_private(path: &Path, contents: &str) -> Result<(), String> {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        .map_err(|e| {
+            denied_or(e, data_dir, |e| {
+                format!("cannot write {}: {e}", path.display())
+            })
+        })?;
+    file.write_all(contents.as_bytes()).map_err(|e| {
+        denied_or(e, data_dir, |e| {
+            format!("cannot write {}: {e}", path.display())
+        })
+    })
+}
+
+/// A permission error on the data directory gets the guardrail; anything else
+/// gets the caller's ordinary message.
+///
+/// **`Permission denied (os error 13)` on a path the developer did not choose
+/// is the class of failure Phase 8 exists to delete**, and in a container it is
+/// almost always one thing: a bind mount whose ownership was not mapped.
+fn denied_or(
+    error: std::io::Error,
+    data_dir: &Path,
+    ordinary: impl FnOnce(std::io::Error) -> String,
+) -> String {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            not_writable(data_dir, Runtime::detect(), current_uid())
+        }
+        _ => ordinary(error),
+    }
+}
+
+/// The message, as a pure function of the three things it depends on, so every
+/// branch of it is testable without a read-only directory or a container.
+pub fn not_writable(data_dir: &Path, runtime: Runtime, uid: Option<u32>) -> String {
+    let who = match uid {
+        Some(uid) => format!(" by uid {uid}"),
+        None => String::new(),
+    };
+    let where_ = match runtime {
+        Runtime::Host => String::new(),
+        _ => " (this process is in a container)".to_string(),
+    };
+
+    // **The runtime's own remedy first.** Rootless podman maps the container's
+    // root to the invoking user and every other uid into a subuid range, so a
+    // directory you own appears inside as root's and uid 65532 cannot write it.
+    // Under rootful Docker the same mount behaves the other way around, which
+    // is why the two commands are opposites rather than variants.
+    let remedies = match runtime {
+        Runtime::Docker => [
+            "docker run --user $(id -u):$(id -g)  …    # docker",
+            "podman run -v ./lanyard-data:/data:U …    # podman, rootless",
+        ],
+        _ => [
+            "podman run -v ./lanyard-data:/data:U …    # podman, rootless",
+            "docker run --user $(id -u):$(id -g)  …    # docker",
+        ],
+    };
+
+    // Built line by line rather than as one format string: the message's shape
+    // — an indented block of two commands to paste — is the point of it, and a
+    // formatter that rewrapped a string literal would quietly destroy that.
+    [
+        format!("{} is not writable{who}{where_}.", data_dir.display()),
+        "  A bind-mounted data directory needs its ownership mapped. Try:".to_string(),
+        format!("      {}", remedies[0]),
+        format!("      {}", remedies[1]),
+        "  Or drop the volume entirely: the default signing key is deterministic, so a".to_string(),
+        "  container with no volume already produces the same kid every time.".to_string(),
+    ]
+    .join("\n")
+}
+
+/// This process's uid, without a libc dependency.
+///
+/// `/proc/self` is owned by the process that is looking at it, which is the one
+/// fact needed here — and the one the error message is useless without, because
+/// "not writable" with no uid leaves the reader guessing which side to change.
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 pub fn key_path(data_dir: &Path) -> PathBuf {
@@ -257,6 +342,101 @@ mod tests {
             err.contains(key_path(dir.path()).to_str().unwrap()),
             "error must name the file: {err}"
         );
+    }
+
+    /// **The class of failure Phase 8 exists to delete.** A bare
+    /// `Permission denied (os error 13)` on a path the developer did not choose
+    /// tells them nothing; this names the directory, the uid, and both
+    /// runtimes' fix.
+    #[test]
+    fn an_unwritable_data_dir_names_the_directory_the_uid_and_both_fixes() {
+        let message = not_writable(Path::new("/data"), Runtime::Podman, Some(65532));
+
+        assert!(
+            message.starts_with("/data is not writable by uid 65532"),
+            "{message}"
+        );
+        assert!(message.contains("in a container"), "{message}");
+        assert!(message.contains("-v ./lanyard-data:/data:U"), "{message}");
+        assert!(message.contains("--user $(id -u):$(id -g)"), "{message}");
+        assert!(
+            message.contains("no volume already produces the same kid"),
+            "the answer is often that the volume was never needed: {message}"
+        );
+        assert!(!message.contains("os error"), "{message}");
+    }
+
+    /// Rootless podman and rootful Docker map ownership in **opposite**
+    /// directions, so the runtime's own remedy goes first rather than being one
+    /// of two equal options.
+    #[test]
+    fn the_detected_runtimes_remedy_is_the_first_one_offered() {
+        let podman = not_writable(Path::new("/data"), Runtime::Podman, Some(65532));
+        assert!(
+            podman.find(":U").unwrap() < podman.find("--user").unwrap(),
+            "{podman}"
+        );
+
+        let docker = not_writable(Path::new("/data"), Runtime::Docker, Some(65532));
+        assert!(
+            docker.find("--user").unwrap() < docker.find(":U").unwrap(),
+            "{docker}"
+        );
+    }
+
+    /// Outside a container the same mount problem is possible and the sentence
+    /// about being in one would be a lie.
+    #[test]
+    fn on_the_host_the_message_does_not_claim_to_be_in_a_container() {
+        let message = not_writable(Path::new("/srv/lanyard"), Runtime::Host, Some(1000));
+        assert!(!message.contains("in a container"), "{message}");
+        assert!(
+            message.contains("/srv/lanyard is not writable by uid 1000"),
+            "{message}"
+        );
+    }
+
+    /// The real path, through `load_or_create`, on a directory nothing can
+    /// write to.
+    #[test]
+    fn load_or_create_on_an_unwritable_directory_gives_the_guardrail() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // root writes anywhere, so there is nothing to observe.
+        if current_uid() == Some(0) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = load_or_create(&data_dir).unwrap_err();
+
+        assert!(err.contains(data_dir.to_str().unwrap()), "{err}");
+        assert!(err.contains("is not writable"), "{err}");
+        assert!(
+            !err.contains("os error 13"),
+            "no bare errno, which is the whole point: {err}"
+        );
+
+        // Left as we found it, so the tempdir can be cleaned up.
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A permission error is one failure; every other one keeps the message it
+    /// had, because "not writable" would be wrong about them.
+    #[test]
+    fn a_non_permission_failure_keeps_its_ordinary_message() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the data directory should be: `create_dir_all` fails,
+        // but not for want of permission.
+        let data_dir = dir.path().join("in-the-way");
+        fs::write(&data_dir, "not a directory").unwrap();
+
+        let err = load_or_create(&data_dir).unwrap_err();
+        assert!(!err.contains("is not writable"), "{err}");
     }
 
     fn mode(path: &Path) -> u32 {

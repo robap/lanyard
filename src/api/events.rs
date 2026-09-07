@@ -128,7 +128,7 @@ mod tests {
     use crate::events::{EventBus, EventDraft};
 
     fn event() -> Event {
-        EventBus::new().publish(EventDraft {
+        EventBus::new(crate::clock::Clock::real()).publish(EventDraft {
             client_id: Some("billing-web".to_owned()),
             endpoint: "/oidc/token".to_owned(),
             method: "POST".to_owned(),

@@ -151,6 +151,7 @@ fn client_credentials(state: &SharedState, headers: &HeaderMap, form: &Form) -> 
 
     match issue::issue(
         &state.key,
+        state.clock,
         &state.config.issuer,
         persona,
         &overrides,
@@ -339,6 +340,7 @@ fn authorization_code(state: &SharedState, form: &Form) -> Response {
 
     let access = match issue::issue(
         &state.key,
+        state.clock,
         &state.config.issuer,
         Some(&record.persona),
         &overrides,
@@ -582,6 +584,7 @@ fn refresh_token(state: &SharedState, form: &Form) -> Response {
 
     let access = match issue::issue(
         &state.key,
+        state.clock,
         &state.config.issuer,
         Some(&record.persona),
         &overrides,
@@ -717,6 +720,7 @@ fn id_token(
     // objects to. Decided, not accidental.
     issue::issue(
         &state.key,
+        state.clock,
         &state.config.issuer,
         Some(grant.persona),
         &registered,

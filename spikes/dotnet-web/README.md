@@ -8,6 +8,9 @@ configured. It is Phase 4's primary acceptance client and Phase 5's: criteria 1,
 lanyard serve &          # 127.0.0.1:9500
 cd spikes/dotnet-web
 dotnet run               # http://localhost:5000
+
+# Or point it at a lanyard reachable by another name — Phase 8's one-name setup:
+LANYARD_AUTHORITY=http://lanyard:9500/oidc dotnet run
 ```
 
 Then open <http://localhost:5000/> — **not** `/secure`. The front door is a page

@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::b64;
+use crate::clock::{format_duration, format_offset, round_about, Clock, LEEWAY, SKEW_VAR};
 use crate::keys::SigningKey;
 use crate::oidc::flaw::{self, Flaw};
 
@@ -83,19 +84,31 @@ pub fn sign(
     Ok(format!("{signing_input}.{}", b64::encode(signature)))
 }
 
-/// Verify a token as **lanyard's own**: signature, `iss`, and `exp`, and
-/// nothing else.
+/// Verify a token as **lanyard's own**: signature, `iss`, `nbf` and `exp`.
 ///
-/// `/oidc/userinfo` is the only caller. It does not check `aud`, because there
-/// is no client to check it against — a bearer token arriving at UserInfo was
-/// issued for whatever API the request named, and UserInfo is not that API. It
-/// does not check `nbf` either: lanyard never issues a future `nbf` except
-/// under `flaw=expired`, which moves `exp` too.
+/// It does not check `aud`, because there is no client to check it against — a
+/// bearer token arriving at UserInfo was issued for whatever API the request
+/// named, and UserInfo is not that API.
+///
+/// **It does check `nbf`, and that is a Phase 8 change.** This comment used to
+/// say the opposite, on the grounds that lanyard never issues a future `nbf`;
+/// `LANYARD_CLOCK_SKEW` is exactly what makes that false, and a token that is
+/// not valid yet is the skew symptom most worth naming. Both bounds get
+/// [`LEEWAY`] in both directions, so a relying party a second or two out is not
+/// told its one-second-old token is dead.
 ///
 /// **This is the second place lanyard says no**, and the reason is PKCE's: an
 /// app that reads `/userinfo` with an expired token has a bug, and a mock that
-/// answers anyway hides it.
-pub fn verify(key: &SigningKey, issuer: &str, token: &str) -> Result<Map<String, Value>, String> {
+/// answers anyway hides it. What changed in Phase 8 is not *whether* it says
+/// no but *what it says*: three distinct sentences instead of one, because
+/// "expired" and "your clocks disagree" are different bugs with different
+/// fixes.
+pub fn verify(
+    key: &SigningKey,
+    clock: Clock,
+    issuer: &str,
+    token: &str,
+) -> Result<Map<String, Value>, String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err("the token is not a compact JWS of three segments".to_string());
@@ -135,17 +148,56 @@ pub fn verify(key: &SigningKey, issuer: &str, token: &str) -> Result<Map<String,
         ));
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = clock.now();
+
+    // **`nbf` first**, because "not valid yet" is the more specific diagnosis:
+    // a token from a clock five minutes ahead has an `exp` five minutes in the
+    // future too, so the expiry check would pass it silently.
+    if let Some(nbf) = claims.get("nbf").and_then(Value::as_u64) {
+        if nbf > now.saturating_add(LEEWAY) {
+            // `issue()` backdates `nbf` by the leeway, and `iss` has already
+            // been checked to be ours — so adding it back reconstructs the
+            // issuing clock's own `iat`, which is the number a developer can
+            // act on.
+            let ahead = nbf.saturating_add(LEEWAY).saturating_sub(now);
+            return Err(format!(
+                "the token is not valid yet — the clock that issued it is ahead of this one \
+                 by about {}. Check the clocks on both sides; run lanyard doctor{}",
+                format_duration(round_about(ahead)),
+                own_skew(clock),
+            ));
+        }
+    }
+
     match claims.get("exp").and_then(Value::as_u64) {
-        Some(exp) if exp > now => {}
-        Some(_) => return Err("the token has expired".to_string()),
+        Some(exp) if exp.saturating_add(LEEWAY) > now => {}
+        Some(exp) => {
+            return Err(format!(
+                "the token expired {} ago{}",
+                format_duration(now.saturating_sub(exp)),
+                own_skew(clock),
+            ))
+        }
         None => return Err("the token has no exp".to_string()),
     }
 
     Ok(claims)
+}
+
+/// The parenthetical a **skewed** process adds to every refusal, and nothing at
+/// all otherwise.
+///
+/// A `401` whose real cause is a variable the developer exported an hour ago is
+/// the bare rejection this phase exists to delete — so the process that is
+/// lying about the time is the one that has to say so.
+fn own_skew(clock: Clock) -> String {
+    if !clock.is_skewed() {
+        return String::new();
+    }
+    format!(
+        " (this process's clock is skewed by {} via {SKEW_VAR})",
+        format_offset(clock.skew_seconds())
+    )
 }
 
 #[cfg(test)]
@@ -333,10 +385,7 @@ mod verify_tests {
     }
 
     fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
+        Clock::real().now()
     }
 
     fn token_with(iss: &str, exp: u64, flaw: Option<Flaw>) -> String {
@@ -349,7 +398,13 @@ mod verify_tests {
 
     #[test]
     fn a_good_token_verifies_and_hands_back_its_claims() {
-        let claims = verify(&key(), ISSUER, &token_with(ISSUER, now() + 60, None)).unwrap();
+        let claims = verify(
+            &key(),
+            Clock::real(),
+            ISSUER,
+            &token_with(ISSUER, now() + 60, None),
+        )
+        .unwrap();
         assert_eq!(claims["sub"], "ada");
     }
 
@@ -357,14 +412,136 @@ mod verify_tests {
     /// token hides the bug in the app that presented it.
     #[test]
     fn an_expired_token_is_refused_and_says_so() {
-        let err = verify(&key(), ISSUER, &token_with(ISSUER, now() - 1, None)).unwrap_err();
+        let err = verify(
+            &key(),
+            Clock::real(),
+            ISSUER,
+            &token_with(ISSUER, now() - 60, None),
+        )
+        .unwrap_err();
         assert!(err.contains("expired"), "{err}");
+    }
+
+    /// **lanyard allows itself the same 5 seconds it backdates `nbf` by.** A
+    /// relying party whose clock is a second or two behind must not be told its
+    /// one-second-old token is dead.
+    #[test]
+    fn a_token_a_few_seconds_past_exp_is_still_accepted() {
+        let claims = verify(
+            &key(),
+            Clock::real(),
+            ISSUER,
+            &token_with(ISSUER, now() - 3, None),
+        )
+        .expect("three seconds past exp is inside the leeway");
+        assert_eq!(claims["sub"], "ada");
+    }
+
+    /// And a token well past it is refused **naming how long ago** — the
+    /// difference between "your token is dead" and "your clocks are wrong".
+    #[test]
+    fn a_token_well_past_exp_says_how_long_ago_it_expired() {
+        let err = verify(
+            &key(),
+            Clock::real(),
+            ISSUER,
+            &token_with(ISSUER, now() - 252, None),
+        )
+        .unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        // Either side of a second boundary, because the clock can tick between
+        // building the token and verifying it. The point is that the elapsed
+        // time is *named*, to the second, rather than that it is 252 exactly.
+        assert!(
+            err.contains("4m12s ago") || err.contains("4m13s ago"),
+            "{err}"
+        );
+    }
+
+    /// The skew symptom, named. A token minted by a process five minutes ahead
+    /// is *not valid yet*, and saying "expired" or nothing at all is the bare
+    /// `401` this whole phase exists to delete.
+    #[test]
+    fn a_token_from_a_clock_that_is_ahead_is_not_valid_yet() {
+        let token = minted_at(Clock::skewed(300));
+
+        let err = verify(&key(), Clock::real(), ISSUER, &token).unwrap_err();
+        assert!(err.contains("not valid yet"), "{err}");
+        assert!(
+            !err.contains("4m5"),
+            "\"about 4m57s\" undoes its own hedge: {err}"
+        );
+        assert!(err.contains("ahead of this one"), "{err}");
+        assert!(err.contains("5m0s"), "the offset, not just the fact: {err}");
+        assert!(err.contains("lanyard doctor"), "{err}");
+        assert!(!err.contains("expired"), "not 'expired': {err}");
+    }
+
+    /// A token a couple of seconds into the future is a clock that is a couple
+    /// of seconds out, not a diagnosis worth a `401`.
+    #[test]
+    fn a_token_a_few_seconds_early_is_accepted() {
+        assert!(verify(&key(), Clock::real(), ISSUER, &minted_at(Clock::skewed(3))).is_ok());
+    }
+
+    /// **A dev tool may lie about the time; it may not do so quietly.** A
+    /// process running skewed says so in every refusal it hands out, because
+    /// the alternative is a `401` whose real cause is a variable the developer
+    /// exported an hour ago.
+    #[test]
+    fn a_skewed_process_names_its_own_skew_in_the_refusal() {
+        // Five minutes past the *skewed* process's own clock, which is ten
+        // minutes past the machine's — the arithmetic the message reports.
+        let err = verify(
+            &key(),
+            Clock::skewed(-300),
+            ISSUER,
+            &token_with(ISSUER, now() - 600, None),
+        )
+        .unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        assert!(err.contains("LANYARD_CLOCK_SKEW"), "{err}");
+        assert!(err.contains("-5m0s"), "{err}");
+    }
+
+    /// The clock is the *process's*, not the machine's: a server five minutes
+    /// behind is what makes a perfectly good token look unborn.
+    #[test]
+    fn a_skewed_process_names_its_skew_on_the_not_valid_yet_message_too() {
+        let err = verify(
+            &key(),
+            Clock::skewed(-300),
+            ISSUER,
+            &minted_at(Clock::real()),
+        )
+        .unwrap_err();
+        assert!(err.contains("not valid yet"), "{err}");
+        assert!(err.contains("LANYARD_CLOCK_SKEW"), "{err}");
+    }
+
+    /// A whole token as `issue()` would have minted it on `clock` — `nbf`
+    /// backdated by the leeway and all — so the tests above exercise the shape
+    /// lanyard actually emits rather than one assembled by hand.
+    fn minted_at(clock: Clock) -> String {
+        crate::oidc::issue::issue(
+            &key(),
+            clock,
+            ISSUER,
+            None,
+            &Map::new(),
+            60,
+            None,
+            &crate::oidc::scope::ClaimFilter::Unfiltered,
+        )
+        .unwrap()
+        .token
     }
 
     #[test]
     fn a_token_from_another_issuer_is_refused() {
         let err = verify(
             &key(),
+            Clock::real(),
             ISSUER,
             &token_with("https://elsewhere.test", now() + 60, None),
         )
@@ -377,22 +554,22 @@ mod verify_tests {
     #[test]
     fn the_flawed_tokens_are_refused_by_name() {
         let expired = sign_flawed(Flaw::Expired);
-        assert!(verify(&key(), ISSUER, &expired)
+        assert!(verify(&key(), Clock::real(), ISSUER, &expired)
             .unwrap_err()
             .contains("expired"));
 
         let unsigned = sign_flawed(Flaw::AlgNone);
-        assert!(verify(&key(), ISSUER, &unsigned)
+        assert!(verify(&key(), Clock::real(), ISSUER, &unsigned)
             .unwrap_err()
             .contains("unsigned"));
 
         let broken = sign_flawed(Flaw::BadSignature);
-        assert!(verify(&key(), ISSUER, &broken)
+        assert!(verify(&key(), Clock::real(), ISSUER, &broken)
             .unwrap_err()
             .contains("does not verify"));
 
         let wrong_iss = sign_flawed(Flaw::WrongIss);
-        assert!(verify(&key(), ISSUER, &wrong_iss)
+        assert!(verify(&key(), Clock::real(), ISSUER, &wrong_iss)
             .unwrap_err()
             .contains("issued by someone"));
     }
@@ -404,7 +581,7 @@ mod verify_tests {
     #[test]
     fn an_unknown_kid_still_verifies_because_the_signature_is_real() {
         let token = sign_flawed(Flaw::UnknownKid);
-        assert!(verify(&key(), ISSUER, &token).is_ok());
+        assert!(verify(&key(), Clock::real(), ISSUER, &token).is_ok());
     }
 
     fn sign_flawed(flaw: Flaw) -> String {
@@ -424,7 +601,10 @@ mod verify_tests {
     #[test]
     fn something_that_is_not_a_token_is_refused_rather_than_panicking() {
         for garbage in ["", "abc", "a.b", "a.b.c.d", "!!!.!!!.!!!"] {
-            assert!(verify(&key(), ISSUER, garbage).is_err(), "{garbage:?}");
+            assert!(
+                verify(&key(), Clock::real(), ISSUER, garbage).is_err(),
+                "{garbage:?}"
+            );
         }
     }
 }

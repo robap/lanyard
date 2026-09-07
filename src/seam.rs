@@ -107,6 +107,7 @@ async fn token(
 
     match issue::issue(
         &state.key,
+        state.clock,
         &state.config.issuer,
         persona,
         &overrides,

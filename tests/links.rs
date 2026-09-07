@@ -723,10 +723,15 @@ async fn a_broken_source_puts_a_warning_on_the_next_authorize_event() {
         .contains("no such file"));
 }
 
-/// Nothing wrong, nothing said: the field is absent rather than an empty array,
-/// so `jq 'select(.warnings)'` is the whole filter.
+/// Nothing wrong, nothing said: **no registry warning** rather than an empty
+/// one, so `jq 'select(.warnings)'` is the whole filter.
+///
+/// Phase 8 put a second kind of warning on this field — the `Host` mismatch —
+/// and the harness binds an ephemeral port while the issuer stays `:9500`, so
+/// one of those is legitimately here. This test is about the registry, so it
+/// asks about the registry.
 #[tokio::test]
-async fn a_healthy_registry_puts_no_warnings_field_on_an_event() {
+async fn a_healthy_registry_puts_no_warning_on_an_event() {
     let fixture = Fixture::new();
     let (base, events) =
         support::spawn_observed_registry(fixture.served(), Default::default()).await;
@@ -737,11 +742,13 @@ async fn a_healthy_registry_puts_no_warnings_field_on_an_event() {
     .await;
 
     let event = support::logged(&events).into_iter().next().unwrap();
-    assert!(event.warnings.is_none());
-    assert!(serde_json::to_value(&event)
-        .unwrap()
-        .get("warnings")
-        .is_none());
+    let registry_warnings: Vec<&String> = event
+        .warnings
+        .iter()
+        .flatten()
+        .filter(|w| !w.contains("reached as"))
+        .collect();
+    assert!(registry_warnings.is_empty(), "{registry_warnings:?}");
 }
 
 // -------------------------------------------- the unfiltered debugging view --

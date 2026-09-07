@@ -16,6 +16,7 @@
 use serde_json::{Map, Value};
 
 use crate::app::SharedState;
+use crate::clock::Clock;
 use crate::oidc::jws;
 use crate::store::{Lookup, RefreshRecord};
 
@@ -49,7 +50,7 @@ pub fn resolve(state: &SharedState, token: &str) -> Presented {
     // `verify` already refuses an expired token, a foreign one, an unsigned
     // one and a string that is not a compact JWS — every "no" this endpoint
     // owes, decided in the one place that decides it.
-    if let Ok(claims) = jws::verify(&state.key, &state.config.issuer, token) {
+    if let Ok(claims) = jws::verify(&state.key, state.clock, &state.config.issuer, token) {
         let jti = claims
             .get("jti")
             .and_then(Value::as_str)
@@ -103,7 +104,7 @@ pub fn revoke(state: &SharedState, token: &str) {
                 .revoked
                 .lock()
                 .expect("revoked")
-                .revoke(jti, deadline_for(exp));
+                .revoke(jti, deadline_for(state.clock, exp));
         }
         // Dropped *and* recorded: the record going away is what stops the
         // refresh working, and the id being recorded is what lets the next
@@ -121,14 +122,6 @@ pub fn revoke(state: &SharedState, token: &str) {
     }
 }
 
-/// Unix seconds now, which is the clock a token's `exp` is measured on.
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// The moment a token whose `exp` is `exp` would have died on its own.
 ///
 /// The stores hold [`std::time::Instant`]s and a token's `exp` is unix seconds,
@@ -137,8 +130,8 @@ fn unix_now() -> u64 {
 /// records nothing for a deadline that has passed.
 ///
 /// [`Revoked::revoke`]: crate::store::Revoked::revoke
-fn deadline_for(exp: u64) -> std::time::Instant {
-    std::time::Instant::now() + std::time::Duration::from_secs(exp.saturating_sub(unix_now()))
+fn deadline_for(clock: Clock, exp: u64) -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(exp.saturating_sub(clock.now()))
 }
 
 /// Revoke the refresh tokens a browser session was issued — all of them for
@@ -177,7 +170,7 @@ pub fn revoke_session_refresh_tokens(
 /// access token died and whose refresh token still worked would renew straight
 /// past the thing this control exists to make observable (CONCEPT §6).
 pub fn expire_client(state: &SharedState, session_id: &str, client_id: &str) {
-    let now = unix_now();
+    let now = state.clock.now();
     let issued = {
         let sessions = state.stores.sessions.lock().expect("sessions");
         sessions.issuances_for(session_id, client_id, now)
@@ -185,7 +178,7 @@ pub fn expire_client(state: &SharedState, session_id: &str, client_id: &str) {
     {
         let mut revoked = state.stores.revoked.lock().expect("revoked");
         for issuance in issued {
-            revoked.revoke(&issuance.jti, deadline_for(issuance.exp));
+            revoked.revoke(&issuance.jti, deadline_for(state.clock, issuance.exp));
         }
     }
     revoke_session_refresh_tokens(state, session_id, Some(client_id));

@@ -48,6 +48,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub personas: PersonasSource,
     pub links: LinksSource,
+    /// `LANYARD_CLOCK_SKEW`, in signed seconds. `0` for every ordinary run —
+    /// and the reason [`crate::clock::Clock`] is a value on `AppState` rather
+    /// than a global.
+    pub skew: i64,
 }
 
 impl Config {
@@ -90,6 +94,15 @@ impl Config {
             ),
         };
 
+        // The seventh deliberate flaw. Fatal on garbage rather than ignored,
+        // because a variable that silently did nothing would be indisting-
+        // uishable from a clock that agrees — which is the one lie this whole
+        // phase exists to prevent.
+        let skew = match get(crate::clock::SKEW_VAR) {
+            Some(raw) => crate::clock::parse_skew(&raw)?,
+            None => 0,
+        };
+
         // Beside `users.yaml`, which is the other file that answers "where do
         // personas come from".
         let links = match get("LANYARD_LINKS") {
@@ -108,6 +121,7 @@ impl Config {
             data_dir,
             personas,
             links,
+            skew,
         })
     }
 
@@ -320,6 +334,30 @@ mod tests {
             PersonasSource::Explicit(PathBuf::from("/tmp/users.yaml"))
         );
         assert_eq!(c.links, LinksSource(PathBuf::from("/tmp/links.yaml")));
+    }
+
+    /// The seventh deliberate flaw, and the only knob that makes lanyard lie
+    /// about the time — so it is parsed as strictly as the port is.
+    #[test]
+    fn the_clock_skew_is_off_by_default_and_parses_when_set() {
+        let c = Config::resolve(env(&[("HOME", "/home/dev")])).unwrap();
+        assert_eq!(c.skew, 0, "an ordinary run has no skew");
+
+        for (raw, seconds) in [("-5m", -300), ("+90s", 90), ("300", 300)] {
+            let c = Config::resolve(env(&[("HOME", "/home/dev"), ("LANYARD_CLOCK_SKEW", raw)]))
+                .unwrap();
+            assert_eq!(c.skew, seconds, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_garbage_clock_skew_is_fatal_and_names_the_variable() {
+        let err = Config::resolve(env(&[
+            ("HOME", "/home/dev"),
+            ("LANYARD_CLOCK_SKEW", "soon"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("LANYARD_CLOCK_SKEW"), "{err}");
     }
 
     #[test]
