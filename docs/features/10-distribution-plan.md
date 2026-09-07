@@ -283,6 +283,20 @@ differed, or a risk that resolved.
   sleeps, but in the safe direction — it needs the sleep to *exceed* a deadline,
   and overshooting only helps — so it was left alone.
 
+- **`oci-mediatypes=false` and BuildKit's default attestations are mutually
+  exclusive.** The dispatched image run failed on *both* architectures at the
+  same step with `ERROR: cannot export attestations with "oci-mediatypes=false"`.
+  BuildKit attaches a provenance attestation to every image by default, and an
+  attestation can only be expressed in the newer OCI format — which is exactly
+  the format we opted out of, because `HEALTHCHECK` is a field of the older
+  Docker image config and this image's health probe is the only thing in it that
+  can run.
+  **Fixed with `--provenance=false --sbom=false`.** That is the resolution we
+  wanted independently: each attestation is published as an extra entry with an
+  `unknown/unknown` platform, which would clutter `podman manifest inspect`
+  (spec criterion 13 reads that output) and would have made the `manifest` job's
+  "expected 2 digests" check wrong.
+
 - **`on: release: [published]` does not fire, and `v0.1.0-rc.1` is how we found
   out.** The rc's Release workflow went green and published the prerelease, and
   `release-image.yml` never started. The cause is a deliberate GitHub rule: the

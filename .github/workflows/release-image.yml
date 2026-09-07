@@ -132,7 +132,7 @@ jobs:
           echo '${{ github.token }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
-      # Two flags here are not arbitrary:
+      # Three flags here are not arbitrary, and they depend on each other:
       #
       # `--driver docker-container` — the builder Docker uses by default cannot
       # upload an image without giving it a tag. We do not want a tag yet: this
@@ -141,8 +141,16 @@ jobs:
       #
       # `oci-mediatypes=false` — writes the image in Docker's older format,
       # which supports HEALTHCHECK. Our image has no shell in it, so the health
-      # check is the only way anything can tell whether the container is up. In
-      # the newer format that instruction would be silently dropped.
+      # check is the only way anything can tell whether the container is up.
+      #
+      # `--provenance=false --sbom=false` — turns off the build-signature and
+      # bill-of-materials extras the builder adds by default. They are only
+      # expressible in the newer format, so leaving them on contradicts the line
+      # above and the build fails outright with "cannot export attestations with
+      # oci-mediatypes=false". Turning them off is what we wanted anyway: each
+      # one adds an extra entry to the published image that shows up as an
+      # `unknown/unknown` platform, which is noise in `podman manifest inspect`
+      # and would break the two-architectures check in the next job.
       - name: Build the image and upload it
         id: push
         run: |
@@ -152,6 +160,8 @@ jobs:
             --file Dockerfile \
             --build-arg BINARY_STAGE=prebuilt \
             --platform '${{ matrix.platform }}' \
+            --provenance=false \
+            --sbom=false \
             --metadata-file metadata.json \
             --output "type=image,name=$IMAGE,oci-mediatypes=false,push-by-digest=true,name-canonical=true,push=true"
           digest=$(jq -r '."containerimage.digest"' metadata.json)
